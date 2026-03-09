@@ -1,0 +1,9 @@
+# QSWAT+ Preprocessor - Streamlit configuration
+# https://docs.streamlit.io/develop/api-reference/configuration
+
+[server]
+# Maximum size in MB for a single file upload (1024 = 1 GB)
+maxUploadSize = 1024
+
+[browser]
+gatherUsageStats = false

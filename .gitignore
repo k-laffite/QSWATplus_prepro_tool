@@ -1,0 +1,14 @@
+# Ignore data folders
+data/
+huc_gdb/
+
+# Ignore large spatial files
+*.tif
+*.gdb
+*.shp
+*.shx
+*.dbf
+
+# Ignore Python environments
+env_gis_ml/
+__pycache__/
