@@ -55,6 +55,15 @@ def load_vector_from_zip(extracted_dir: Path) -> Tuple[gpd.GeoDataFrame, Dict[st
     return gdf, metadata
 
 
+def get_numeric_columns(gdf: gpd.GeoDataFrame) -> list:
+    """Return list of column names that are numeric (excluding geometry), for use as raster value source."""
+    geom_name = gdf.geometry.name
+    return [
+        c for c in gdf.columns
+        if c != geom_name and pd.api.types.is_numeric_dtype(gdf[c])
+    ]
+
+
 def load_vector_from_path(path: Path) -> Tuple[gpd.GeoDataFrame, Dict[str, Any]]:
     """Load a vector layer from a path (directory with .shp or path to .shp)."""
     path = Path(path)

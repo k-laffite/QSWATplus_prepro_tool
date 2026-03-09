@@ -13,8 +13,10 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rasterio
+from rasterio.features import rasterize as rasterio_rasterize
 from rasterio.merge import merge as rasterio_merge
 from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.transform import from_bounds
 import rasterio.mask
 
 # Allowed HUC attribute column names in the HUC File Geodatabase.
@@ -110,6 +112,102 @@ def _bounds_dict(bounds: Any) -> Dict[str, float]:
     """Return bounds as a serializable dict."""
     left, bottom, right, top = bounds
     return {"left": float(left), "bottom": float(bottom), "right": float(right), "top": float(top)}
+
+
+def rasterize_vector_to_raster(
+    gdf: gpd.GeoDataFrame,
+    value_column: str,
+    out_path: Path,
+    template_raster_path: Optional[str] = None,
+    target_resolution: Optional[float] = None,
+    nodata: int = -9999,
+) -> str:
+    """
+    Rasterize a GeoDataFrame using a numeric attribute for cell values.
+
+    If template_raster_path is provided (e.g. a DEM), the output grid uses that
+    raster's transform, shape, and CRS so the result aligns perfectly with the DEM.
+    Otherwise, target_resolution (in CRS units, e.g. meters) is required and the
+    grid is built from the GeoDataFrame's extent.
+
+    Parameters
+    ----------
+    gdf : GeoDataFrame
+        Vector layer to rasterize.
+    value_column : str
+        Column name whose values become raster pixel values (must be numeric).
+    out_path : Path
+        Output GeoTIFF path.
+    template_raster_path : str, optional
+        Path to a raster (e.g. DEM) to use for transform, shape, and CRS.
+    target_resolution : float, optional
+        Resolution in CRS units (e.g. meters) when no template is used.
+    nodata : int
+        NoData value for the output raster.
+
+    Returns
+    -------
+    str
+        Path to the written raster.
+    """
+    out_path = Path(out_path)
+    gdf = gdf.copy()
+    if gdf.crs is None:
+        raise ValueError("GeoDataFrame must have a CRS set.")
+
+    if template_raster_path:
+        with rasterio.open(template_raster_path) as src:
+            template_crs = src.crs
+            template_transform = src.transform
+            template_shape = (src.height, src.width)
+        if gdf.crs != template_crs:
+            gdf = gdf.to_crs(template_crs)
+        out_transform = template_transform
+        out_shape = template_shape
+        out_crs = template_crs
+    else:
+        if target_resolution is None or target_resolution <= 0:
+            raise ValueError("target_resolution (e.g. 30 meters) is required when no template raster is provided.")
+        left, bottom, right, top = gdf.total_bounds
+        # Pixel size in x and y (same for typical DEM)
+        width_px = int((right - left) / target_resolution)
+        height_px = int((top - bottom) / target_resolution)
+        width_px = max(1, width_px)
+        height_px = max(1, height_px)
+        out_transform = from_bounds(left, bottom, right, top, width_px, height_px)
+        out_shape = (height_px, width_px)
+        out_crs = gdf.crs
+
+    # Build (geometry, value) pairs; use numeric type for raster
+    values = gdf[value_column]
+    if not pd.api.types.is_numeric_dtype(values):
+        values = pd.to_numeric(values, errors="coerce")
+    shapes = [(geom, int(val) if pd.notna(val) else nodata) for geom, val in zip(gdf.geometry, values)]
+
+    rasterized = rasterio_rasterize(
+        shapes,
+        out_shape=out_shape,
+        transform=out_transform,
+        fill=nodata,
+        dtype="int32",
+        nodata=nodata,
+    )
+
+    with rasterio.open(
+        out_path,
+        "w",
+        driver="GTiff",
+        height=out_shape[0],
+        width=out_shape[1],
+        count=1,
+        dtype="int32",
+        crs=out_crs,
+        transform=out_transform,
+        nodata=nodata,
+    ) as dest:
+        dest.write(rasterized, 1)
+
+    return str(out_path)
 
 
 def get_raster_resolution(path: str) -> Optional[str]:

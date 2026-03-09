@@ -10,8 +10,10 @@ Sequential workflow:
 """
 
 import io
+import shutil
 import tempfile
 import zipfile
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,6 +24,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from utils.file_handlers import (
+    get_numeric_columns,
     load_raster,
     load_vector_from_path,
     load_vector_from_zip,
@@ -32,6 +35,7 @@ from utils.spatial_processing import (
     find_and_load_huc,
     get_raster_resolution,
     mosaic_rasters,
+    rasterize_vector_to_raster,
     clip_raster_to_geometry,
     clip_vector_to_geometry,
     reproject_raster,
@@ -88,7 +92,8 @@ def _save_uploaded_files(
 ) -> List[Dict[str, Any]]:
     """
     Save uploaded files to cache and return list of {path, name, metadata}.
-    Handles .tif/.tiff and .zip (shapefile).
+    For DEM: .tif/.tiff only. For Land Use/Soil: .tif, .tiff, .zip, and shapefile components (.shp, .shx, .dbf, .prj).
+    Shapefile components with the same base name are grouped into one vector layer.
     """
     if not uploaded_files:
         return []
@@ -96,48 +101,91 @@ def _save_uploaded_files(
     cache_dir = Path(st.session_state["upload_cache_dir"])
     layer_dir = cache_dir / layer_key
     layer_dir.mkdir(parents=True, exist_ok=True)
-    # Clear previous files for this layer so we replace with new selection
     for f in layer_dir.iterdir():
         try:
-            f.unlink()
+            if f.is_file():
+                f.unlink()
+            else:
+                shutil.rmtree(f, ignore_errors=True)
         except OSError:
             pass
 
-    results = []
-    for i, uf in enumerate(uploaded_files):
+    vector_extensions = (".shp", ".shx", ".dbf", ".prj")
+    shapefile_groups: Dict[str, List[Any]] = defaultdict(list)
+    zips = []
+    tifs = []
+    for uf in uploaded_files:
         name = uf.name
         suffix = Path(name).suffix.lower()
         if suffix not in accepted_extensions:
             continue
-        path = layer_dir / f"{i}_{name}"
-        path.write_bytes(uf.getbuffer())
+        if suffix == ".zip":
+            zips.append(uf)
+        elif suffix in (".tif", ".tiff"):
+            tifs.append(uf)
+        elif suffix in vector_extensions:
+            shapefile_groups[Path(name).stem].append(uf)
 
+    results = []
+    idx = 0
+    for uf in zips:
+        name = uf.name
+        path = layer_dir / f"{idx}_{name}"
+        path.write_bytes(uf.getbuffer())
         try:
-            if suffix == ".zip":
-                with zipfile.ZipFile(path, "r") as zf:
-                    extract_dir = layer_dir / f"{i}_extracted"
-                    extract_dir.mkdir(exist_ok=True)
-                    zf.extractall(extract_dir)
-                gdf, meta = load_vector_from_path(extract_dir)
-                meta["path"] = str(extract_dir)
-                meta["name"] = name
-                meta["resolution"] = None
-                results.append({"path": str(extract_dir), "name": name, "metadata": meta, "gdf": gdf})
-            elif suffix in (".tif", ".tiff"):
-                _, meta = load_raster(path)
-                meta["name"] = name
-                results.append({"path": str(path), "name": name, "metadata": meta})
-            else:
-                continue
+            with zipfile.ZipFile(path, "r") as zf:
+                extract_dir = layer_dir / f"{idx}_extracted"
+                extract_dir.mkdir(exist_ok=True)
+                zf.extractall(extract_dir)
+            gdf, meta = load_vector_from_path(extract_dir)
+            meta["path"] = str(extract_dir)
+            meta["name"] = name
+            meta["resolution"] = None
+            results.append({"path": str(extract_dir), "name": name, "metadata": meta})
         except Exception as e:
             st.warning(f"Could not load {name}: {e}")
+        idx += 1
+
+    for uf in tifs:
+        name = uf.name
+        path = layer_dir / f"{idx}_{name}"
+        path.write_bytes(uf.getbuffer())
+        try:
+            _, meta = load_raster(path)
+            meta["name"] = name
+            results.append({"path": str(path), "name": name, "metadata": meta})
+        except Exception as e:
+            st.warning(f"Could not load {name}: {e}")
+        idx += 1
+
+    for stem, group in shapefile_groups.items():
+        if not group:
             continue
+        # Require at least .shp; .shx and .dbf are typically needed for reading
+        has_shp = any(Path(f.name).suffix.lower() == ".shp" for f in group)
+        if not has_shp:
+            continue
+        extract_dir = layer_dir / f"{idx}_shp_{stem}"
+        extract_dir.mkdir(exist_ok=True)
+        for uf in group:
+            (extract_dir / uf.name).write_bytes(uf.getbuffer())
+        try:
+            gdf, meta = load_vector_from_path(extract_dir)
+            meta["path"] = str(extract_dir)
+            meta["name"] = group[0].name if len(group) == 1 else f"{stem}.shp (and components)"
+            meta["resolution"] = None
+            results.append({"path": str(extract_dir), "name": meta["name"], "metadata": meta})
+        except Exception as e:
+            st.warning(f"Could not load shapefile {stem}: {e}")
+        idx += 1
 
     return results
 
 
 def _get_layer_data_for_map(entry: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-    """Return (data, metadata) for one layer entry for mapping. Data is gdf or raster path."""
+    """Return (data, metadata) for one layer entry for mapping. Uses rasterized_path if set."""
+    if entry.get("rasterized_path"):
+        return entry["rasterized_path"], entry["raster_metadata"]
     meta = entry["metadata"]
     if meta["type"] == "vector":
         gdf, _ = load_vector_from_path(Path(entry["path"]))
@@ -196,7 +244,8 @@ def step2_uploads_section() -> None:
 
     st.markdown(
         "Upload one or more files per layer (e.g. multiple DEM tiles). "
-        "Rasters: GeoTIFF (`.tif`). Vectors: zipped Shapefile (`.zip`)."
+        "**Rasters:** GeoTIFF (`.tif`). **Vectors:** zipped Shapefile (`.zip`) or components (`.shp`, `.shx`, `.dbf`, `.prj`). "
+        "Vector Land Use/Soil layers can be rasterized to match the DEM grid below."
     )
 
     col1, col2, col3 = st.columns(3)
@@ -229,12 +278,88 @@ def step2_uploads_section() -> None:
         )
     if landuse_files:
         st.session_state["landuse_uploads"] = _save_uploaded_files(
-            landuse_files, "landuse", (".tif", ".tiff", ".zip")
+            landuse_files, "landuse",
+            (".tif", ".tiff", ".zip", ".shp", ".shx", ".dbf", ".prj"),
         )
     if soil_files:
         st.session_state["soil_uploads"] = _save_uploaded_files(
-            soil_files, "soil", (".tif", ".tiff", ".zip")
+            soil_files, "soil",
+            (".tif", ".tiff", ".zip", ".shp", ".shx", ".dbf", ".prj"),
         )
+
+    # Vector attribute selection and rasterization for Land Use / Soil
+    cache_dir = Path(st.session_state["upload_cache_dir"])
+    dem_uploads = st.session_state.get("dem_uploads") or []
+    template_dem_path = dem_uploads[0]["path"] if dem_uploads else None
+
+    for label, layer_key in [("Land Use", "landuse_uploads"), ("Soil", "soil_uploads")]:
+        uploads = st.session_state.get(layer_key) or []
+        for i, u in enumerate(uploads):
+            meta = u.get("metadata", {})
+            if meta.get("type") != "vector":
+                continue
+            gdf, _ = load_vector_from_path(Path(u["path"]))
+            numeric_cols = get_numeric_columns(gdf)
+            if not numeric_cols:
+                st.warning(f"**{label}** layer «{u['name']}» has no numeric columns; cannot rasterize.")
+                continue
+            default_ix = numeric_cols.index("GRIDCODE") if "GRIDCODE" in numeric_cols else 0
+            col = st.selectbox(
+                f"Select the numeric column to use for raster values — {label}: {u['name']}",
+                options=numeric_cols,
+                index=default_ix,
+                key=f"vec_col_{layer_key}_{i}",
+            )
+
+            res_method = st.radio(
+                "Select Resolution Method",
+                options=["Match uploaded DEM", "Provide custom resolution"],
+                key=f"vec_res_method_{layer_key}_{i}",
+                horizontal=True,
+            )
+
+            template_path = None
+            target_res = None
+            can_rasterize = False
+
+            if res_method == "Match uploaded DEM":
+                if template_dem_path:
+                    template_path = template_dem_path
+                    can_rasterize = True
+                else:
+                    st.warning(
+                        "Please upload a DEM first, or choose a custom resolution."
+                    )
+                    can_rasterize = False
+            else:
+                target_res = st.number_input(
+                    "Cell Size (in map units)",
+                    min_value=0.1,
+                    value=30.0,
+                    step=1.0,
+                    key=f"vec_res_{layer_key}_{i}",
+                    help="Resolution used to build the output grid from the shapefile extent.",
+                )
+                can_rasterize = True
+
+            if col and can_rasterize and (template_path or target_res is not None):
+                layer_dir = cache_dir / layer_key
+                layer_dir.mkdir(parents=True, exist_ok=True)
+                out_path = layer_dir / f"rasterized_{i}.tif"
+                try:
+                    rasterize_vector_to_raster(
+                        gdf,
+                        col,
+                        out_path,
+                        template_raster_path=template_path,
+                        target_resolution=target_res if not template_path else None,
+                    )
+                    _, rmeta = load_raster(out_path)
+                    rmeta["name"] = u["name"]
+                    u["rasterized_path"] = str(out_path)
+                    u["raster_metadata"] = rmeta
+                except Exception as ex:
+                    st.error(f"Rasterization failed for {u['name']}: {ex}")
 
     # Summary table: Layer Name, Type, CRS, Resolution
     st.subheader("Upload summary")
@@ -242,11 +367,12 @@ def step2_uploads_section() -> None:
     for label, key in [("DEM", "dem_uploads"), ("Land Use", "landuse_uploads"), ("Soil", "soil_uploads")]:
         uploads = st.session_state.get(key) or []
         for u in uploads:
-            meta = u["metadata"]
+            meta = u.get("raster_metadata") or u.get("metadata")
+            layer_type = meta.get("type", "—")
             rows.append({
                 "Layer Name": u["name"],
                 "Category": label,
-                "Type": meta.get("type", "—"),
+                "Type": layer_type,
                 "CRS": meta.get("crs") or "—",
                 "Resolution": meta.get("resolution") or "—",
             })
@@ -285,14 +411,15 @@ def step3_landuse_extraction_section() -> None:
         st.info("Upload at least one Land Use layer in Step 2 first.")
         return
 
-    # Use first land use layer for extraction
+    # Use first land use layer for extraction (rasterized or native)
     first_lu = landuse_uploads[0]
-    meta = first_lu["metadata"]
+    meta = first_lu.get("raster_metadata") or first_lu["metadata"]
 
     if st.button("Extract land use classes", key="extract_lu_btn"):
         try:
-            if meta["type"] == "raster":
-                df = extract_landuse_classes_raster(first_lu["path"])
+            if first_lu.get("rasterized_path") or meta["type"] == "raster":
+                path = first_lu.get("rasterized_path") or first_lu["path"]
+                df = extract_landuse_classes_raster(path)
             else:
                 gdf, _ = load_vector_from_path(Path(first_lu["path"]))
                 df = extract_landuse_classes_vector(gdf)
@@ -334,7 +461,7 @@ def step4_preprocessing_options_section() -> None:
     ]
     for key in ("dem_uploads", "landuse_uploads", "soil_uploads"):
         for u in st.session_state.get(key) or []:
-            c = u["metadata"].get("crs")
+            c = (u.get("raster_metadata") or u.get("metadata") or {}).get("crs")
             if c and c not in crs_options:
                 crs_options.append(c)
 
@@ -404,7 +531,13 @@ def _run_preprocessing() -> Dict[str, str]:
     ) -> Optional[str]:
         if not uploads:
             return None
-        paths = [u["path"] for u in uploads if u["metadata"]["type"] == "raster"]
+        # Include native rasters and rasterized vector layers
+        paths = []
+        for u in uploads:
+            if u.get("rasterized_path"):
+                paths.append(u["rasterized_path"])
+            elif u.get("metadata", {}).get("type") == "raster":
+                paths.append(u["path"])
         if not paths:
             # Vector-only: take first and reproject/clip
             u = uploads[0]
