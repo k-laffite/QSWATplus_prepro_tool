@@ -111,6 +111,7 @@ def init_session_state() -> None:
         "target_crs": "EPSG:4326",
         "do_mosaic": False,
         "clip_to_huc": False,
+        "reclassify_landuse_to_swat_id": True,
         "processed_outputs": None,
         "upload_cache_dir": None,
     }
@@ -539,6 +540,10 @@ def step3_landuse_extraction_section() -> None:
             else:
                 display_df.insert(1, "Description", "")
 
+        # Ensure a stable row index so edits don't cause rows to jump/reset
+        if "Value" in display_df.columns:
+            display_df = display_df.set_index("Value", drop=False)
+
         # Load SWAT+ reference and build code -> id, code -> description mappings
         swat_ref_df, name_to_id, name_to_desc = _load_swat_ref()
         if "SWAT_Class_Target" in display_df.columns:
@@ -641,6 +646,13 @@ def step4_preprocessing_options_section() -> None:
     if clip_to_huc and st.session_state.get("huc_boundary") is None:
         st.warning("Load a HUC boundary in Step 1 for clipping.")
 
+    reclassify_to_swat_id = st.checkbox(
+        "Reclassify Land Use raster to SWAT_ID values",
+        value=st.session_state.get("reclassify_landuse_to_swat_id", True),
+        key="reclassify_landuse_to_swat_id_cb",
+    )
+    st.session_state["reclassify_landuse_to_swat_id"] = reclassify_to_swat_id
+
 
 def _run_preprocessing() -> Dict[str, str]:
     """
@@ -654,8 +666,13 @@ def _run_preprocessing() -> Dict[str, str]:
     target_crs = st.session_state["target_crs"]
     do_mosaic = st.session_state["do_mosaic"]
     clip_to_huc = st.session_state["clip_to_huc"]
+    reclassify_to_swat_id = st.session_state.get("reclassify_landuse_to_swat_id", True)
     huc_gdf = st.session_state.get("huc_boundary")
-    reclass_df = st.session_state.get("edited_lu_table") or st.session_state.get("reclass_lookup_df")
+    edited_lu = st.session_state.get("edited_lu_table")
+    if edited_lu is not None:
+        reclass_df = edited_lu
+    else:
+        reclass_df = st.session_state.get("reclass_lookup_df")
 
     results = {}
 
@@ -719,23 +736,39 @@ def _run_preprocessing() -> Dict[str, str]:
     if soil_path:
         results["soil"] = soil_path
 
-    # Land Use: possibly reclassify
+    # Land Use: optionally reclassify to SWAT_ID values
     lu_uploads = st.session_state.get("landuse_uploads") or []
     lu_path = _process_raster_list(lu_uploads, "Land Use", "landuse")
-    if lu_path and reclass_df is not None and "Value" in reclass_df.columns and "SWAT_Class_Target" in reclass_df.columns:
-        reclass_path = out_dir / "landuse_reclassified.tif"
-        reclassify_raster_from_lookup(
-            lu_path,
-            reclass_df,
-            value_column="Value",
-            target_column="SWAT_Class_Target",
-            out_path=reclass_path,
-        )
-        results["landuse"] = str(reclass_path)
+
+    if lu_path and reclassify_to_swat_id and reclass_df is not None and "SWAT_ID" in reclass_df.columns:
+        # Filter to rows where SWAT_ID was successfully assigned (non-empty)
+        swat_id_str = reclass_df["SWAT_ID"].astype(str).str.strip()
+        has_swat_id = (swat_id_str != "") & (swat_id_str != "nan")
+        mapped_df = reclass_df.loc[has_swat_id, ["Value", "SWAT_ID"]].dropna(subset=["SWAT_ID"])
+        if not mapped_df.empty:
+            reclass_path = out_dir / "landuse_reclassified.tif"
+            reclassify_raster_from_lookup(
+                lu_path,
+                mapped_df,
+                value_column="Value",
+                target_column="SWAT_ID",
+                out_path=reclass_path,
+            )
+            results["landuse"] = str(reclass_path)
+
+            # Clean lookup: unique SWAT_ID, SWAT_Class_Target, SWAT_Description (drop duplicates)
+            lookup_cols = [c for c in ("SWAT_ID", "SWAT_Class_Target", "SWAT_Description") if c in reclass_df.columns]
+            if lookup_cols:
+                clean_lookup = reclass_df.loc[has_swat_id, lookup_cols].drop_duplicates()
+                swat_lookup_path = out_dir / "swat_landuse_lookup.csv"
+                clean_lookup.to_csv(swat_lookup_path, index=False)
+                results["swat_landuse_lookup_csv"] = str(swat_lookup_path)
+        else:
+            results["landuse"] = lu_path
     elif lu_path:
         results["landuse"] = lu_path
 
-    # Lookup CSV (prefer in-app edited table, then extracted classes)
+    # Full lookup CSV (always export when we have a table)
     if reclass_df is not None:
         lookup_path = out_dir / "land_use_lookup.csv"
         reclass_df.to_csv(lookup_path, index=False)
@@ -768,7 +801,7 @@ def step5_final_preview_section() -> None:
         layers_for_map = []
         huc_gdf = st.session_state.get("huc_boundary")
         for key, path in outputs.items():
-            if key == "lookup_csv":
+            if key in ("lookup_csv", "swat_landuse_lookup_csv"):
                 continue
             path = Path(path)
             if path.suffix.lower() in (".tif", ".tiff"):
