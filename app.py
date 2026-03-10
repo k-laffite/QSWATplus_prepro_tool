@@ -25,6 +25,7 @@ import streamlit.components.v1 as components
 
 from utils.file_handlers import (
     get_numeric_columns,
+    get_text_columns,
     load_raster,
     load_vector_from_path,
     load_vector_from_zip,
@@ -48,6 +49,41 @@ from utils.spatial_processing import (
 # Project root (directory containing app.py)
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+# Path to SWAT+ land use class codes (used in Step 3 dropdown)
+SWAT_CLASSES_CSV = PROJECT_ROOT / "data" / "swat+_classes" / "swat+_classes.csv"
+
+
+@st.cache_data(ttl=3600)
+def _load_swat_ref() -> Tuple[pd.DataFrame, Dict[str, int], Dict[str, str]]:
+    """
+    Load SWAT+ reference CSV and return (df, name_to_id, name_to_desc).
+    name_to_id: code -> numeric id; name_to_desc: code -> description text.
+    Returns (empty df, {}, {}) if file missing or invalid.
+    """
+    if not SWAT_CLASSES_CSV.exists():
+        return pd.DataFrame(), {}, {}
+    try:
+        df = pd.read_csv(SWAT_CLASSES_CSV)
+        for c in ("id", "code", "description"):
+            if c not in df.columns:
+                return pd.DataFrame(), {}, {}
+        df["code"] = df["code"].astype(str).str.strip()
+        df = df.drop_duplicates(subset=["code"], keep="first")
+        name_to_id = df.set_index("code")["id"].astype(int).to_dict()
+        name_to_desc = df.set_index("code")["description"].astype(str).to_dict()
+        return df, name_to_id, name_to_desc
+    except Exception:
+        return pd.DataFrame(), {}, {}
+
+
+@st.cache_data(ttl=3600)
+def _load_swat_class_options() -> List[str]:
+    """Load valid SWAT+ class codes from data/swat+_classes/swat+_classes.csv. Returns list of 'code' values. Cached."""
+    swat_ref_df, name_to_id, _ = _load_swat_ref()
+    if swat_ref_df.empty:
+        return []
+    return swat_ref_df["code"].tolist()
+
 
 def init_page_config() -> None:
     """Configure Streamlit page."""
@@ -69,6 +105,8 @@ def init_session_state() -> None:
         "landuse_uploads": [],
         "soil_uploads": [],
         "land_use_classes_df": None,
+        "lu_desc_mapping": None,
+        "edited_lu_table": None,
         "reclass_lookup_df": None,
         "target_crs": "EPSG:4326",
         "do_mosaic": False,
@@ -182,6 +220,19 @@ def _save_uploaded_files(
     return results
 
 
+def _upload_fingerprint(uploaded_files: List[Any]) -> Optional[tuple]:
+    """Return a hashable fingerprint of the current upload list so we only replace session state when uploads actually change."""
+    if not uploaded_files:
+        return None
+    return tuple((uf.name, uf.size) for uf in uploaded_files)
+
+
+@st.cache_data(ttl=3600)
+def _cached_load_vector_from_path(_path_str: str) -> Tuple[Any, Dict[str, Any]]:
+    """Load vector from path; cached by path string to avoid re-reading on every rerun."""
+    return load_vector_from_path(Path(_path_str))
+
+
 def _get_layer_data_for_map(entry: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
     """Return (data, metadata) for one layer entry for mapping. Uses rasterized_path if set."""
     if entry.get("rasterized_path"):
@@ -271,21 +322,35 @@ def step2_uploads_section() -> None:
             key="soil_uploader",
         )
 
-    # Persist uploads to disk and session state when user provides new files
-    if dem_files:
+    # Persist uploads only when the set of files actually changed (preserves rasterized_path etc.)
+    dem_fp = _upload_fingerprint(dem_files)
+    if dem_fp is not None and st.session_state.get("last_dem_fingerprint") != dem_fp:
         st.session_state["dem_uploads"] = _save_uploaded_files(
             dem_files, "dem", (".tif", ".tiff")
         )
-    if landuse_files:
+        st.session_state["last_dem_fingerprint"] = dem_fp
+    if dem_fp is None:
+        st.session_state["last_dem_fingerprint"] = None
+
+    landuse_fp = _upload_fingerprint(landuse_files)
+    if landuse_fp is not None and st.session_state.get("last_landuse_fingerprint") != landuse_fp:
         st.session_state["landuse_uploads"] = _save_uploaded_files(
             landuse_files, "landuse",
             (".tif", ".tiff", ".zip", ".shp", ".shx", ".dbf", ".prj"),
         )
-    if soil_files:
+        st.session_state["last_landuse_fingerprint"] = landuse_fp
+    if landuse_fp is None:
+        st.session_state["last_landuse_fingerprint"] = None
+
+    soil_fp = _upload_fingerprint(soil_files)
+    if soil_fp is not None and st.session_state.get("last_soil_fingerprint") != soil_fp:
         st.session_state["soil_uploads"] = _save_uploaded_files(
             soil_files, "soil",
             (".tif", ".tiff", ".zip", ".shp", ".shx", ".dbf", ".prj"),
         )
+        st.session_state["last_soil_fingerprint"] = soil_fp
+    if soil_fp is None:
+        st.session_state["last_soil_fingerprint"] = None
 
     # Vector attribute selection and rasterization for Land Use / Soil
     cache_dir = Path(st.session_state["upload_cache_dir"])
@@ -298,7 +363,7 @@ def step2_uploads_section() -> None:
             meta = u.get("metadata", {})
             if meta.get("type") != "vector":
                 continue
-            gdf, _ = load_vector_from_path(Path(u["path"]))
+            gdf, _ = _cached_load_vector_from_path(u["path"])
             numeric_cols = get_numeric_columns(gdf)
             if not numeric_cols:
                 st.warning(f"**{label}** layer «{u['name']}» has no numeric columns; cannot rasterize.")
@@ -309,6 +374,15 @@ def step2_uploads_section() -> None:
                 options=numeric_cols,
                 index=default_ix,
                 key=f"vec_col_{layer_key}_{i}",
+            )
+
+            text_cols = get_text_columns(gdf)
+            desc_options = ["None"] + text_cols
+            desc_col = st.selectbox(
+                "Select the column containing Land Use descriptions (optional)",
+                options=desc_options,
+                index=0,
+                key=f"vec_desc_col_{layer_key}_{i}",
             )
 
             res_method = st.radio(
@@ -342,7 +416,12 @@ def step2_uploads_section() -> None:
                 )
                 can_rasterize = True
 
-            if col and can_rasterize and (template_path or target_res is not None):
+            convert_clicked = st.button(
+                "Convert to Raster",
+                key=f"convert_btn_{layer_key}_{i}",
+                disabled=not (col and can_rasterize and (template_path or target_res is not None)),
+            )
+            if convert_clicked and col and can_rasterize and (template_path or target_res is not None):
                 layer_dir = cache_dir / layer_key
                 layer_dir.mkdir(parents=True, exist_ok=True)
                 out_path = layer_dir / f"rasterized_{i}.tif"
@@ -358,6 +437,18 @@ def step2_uploads_section() -> None:
                     rmeta["name"] = u["name"]
                     u["rasterized_path"] = str(out_path)
                     u["raster_metadata"] = rmeta
+                    if label == "Land Use" and desc_col and desc_col != "None":
+                        mapping = {}
+                        for val in gdf[col].drop_duplicates():
+                            try:
+                                v = int(val) if pd.notna(val) else None
+                                if v is not None:
+                                    desc = gdf.loc[gdf[col] == val, desc_col].iloc[0]
+                                    mapping[v] = str(desc) if pd.notna(desc) else ""
+                            except (ValueError, TypeError):
+                                pass
+                        st.session_state["lu_desc_mapping"] = mapping
+                    st.success(f"Rasterized {u['name']}.")
                 except Exception as ex:
                     st.error(f"Rasterization failed for {u['name']}: {ex}")
 
@@ -431,12 +522,73 @@ def step3_landuse_extraction_section() -> None:
 
     lu_df = st.session_state.get("land_use_classes_df")
     if lu_df is not None:
-        st.subheader("Land use classes (fill SWAT_Class_Target and re-upload in Step 4)")
-        st.dataframe(lu_df, use_container_width=True, hide_index=True)
+        # Use edited table if available so user's SWAT_Class_Target selections persist
+        prev_edited = st.session_state.get("edited_lu_table")
+        if prev_edited is not None and "Value" in prev_edited.columns and "SWAT_Class_Target" in prev_edited.columns:
+            display_df = prev_edited.copy()
+        else:
+            display_df = lu_df.copy()
 
-        csv = lu_df.to_csv(index=False)
+        lu_desc_mapping = st.session_state.get("lu_desc_mapping")
+        if "Description" not in display_df.columns:
+            if lu_desc_mapping is not None:
+                desc_vals = display_df["Value"].apply(
+                    lambda x: lu_desc_mapping.get(int(x), "") if pd.notna(x) else ""
+                )
+                display_df.insert(1, "Description", desc_vals)
+            else:
+                display_df.insert(1, "Description", "")
+
+        # Load SWAT+ reference and build code -> id, code -> description mappings
+        swat_ref_df, name_to_id, name_to_desc = _load_swat_ref()
+        if "SWAT_Class_Target" in display_df.columns:
+            swat_target = display_df["SWAT_Class_Target"].astype(str).str.strip()
+            swat_target = swat_target.replace("", pd.NA).replace("nan", pd.NA)
+            id_vals = swat_target.map(name_to_id)
+            display_df["SWAT_ID"] = id_vals.apply(lambda x: "" if pd.isna(x) else str(int(x)))
+            desc_vals = swat_target.map(name_to_desc)
+            display_df["SWAT_Description"] = desc_vals.fillna("").astype(str).replace("nan", "")
+        else:
+            display_df["SWAT_ID"] = ""
+            display_df["SWAT_Description"] = ""
+
+        st.subheader("Land use classes (edit SWAT_Class_Target below)")
+        swat_class_options = _load_swat_class_options()
+        select_options = [""] + swat_class_options if swat_class_options else []
+        if not swat_class_options:
+            st.warning(
+                "SWAT+ class codes not found (expected data/swat+_classes/swat+_classes.csv). "
+                "Using free-text for SWAT_Class_Target."
+            )
+        if select_options:
+            swat_col_config = st.column_config.SelectboxColumn(
+                "SWAT_Class_Target",
+                options=select_options,
+                help="Select the corresponding SWAT+ land use code from the dropdown.",
+                required=False,
+            )
+        else:
+            swat_col_config = st.column_config.TextColumn("SWAT_Class_Target", disabled=False)
+        column_config = {
+            "Value": st.column_config.NumberColumn("Value", disabled=True),
+            "Description": st.column_config.TextColumn("Description", disabled=True),
+            "Count": st.column_config.NumberColumn("Count", disabled=True),
+            "SWAT_Class_Target": swat_col_config,
+            "SWAT_ID": st.column_config.TextColumn("SWAT_ID", disabled=True, help="SWAT+ class ID (auto-filled from selection)."),
+            "SWAT_Description": st.column_config.TextColumn("SWAT_Description", disabled=True, help="SWAT+ class description (auto-filled from selection)."),
+        }
+        edited = st.data_editor(
+            display_df,
+            column_config=column_config,
+            use_container_width=True,
+            hide_index=True,
+            key="lu_table_editor",
+        )
+        st.session_state["edited_lu_table"] = edited
+
+        csv = edited.to_csv(index=False)
         st.download_button(
-            "Download land use lookup CSV (with blank SWAT_Class_Target)",
+            "Download land use lookup CSV",
             data=csv,
             file_name="land_use_lookup.csv",
             mime="text/csv",
@@ -489,23 +641,6 @@ def step4_preprocessing_options_section() -> None:
     if clip_to_huc and st.session_state.get("huc_boundary") is None:
         st.warning("Load a HUC boundary in Step 1 for clipping.")
 
-    st.subheader("Land Use reclassification")
-    reclass_csv = st.file_uploader(
-        "Upload modified Land Use CSV (with SWAT_Class_Target filled)",
-        type=["csv"],
-        key="reclass_csv_uploader",
-    )
-    if reclass_csv:
-        try:
-            df = pd.read_csv(reclass_csv)
-            if "SWAT_Class_Target" in df.columns:
-                st.session_state["reclass_lookup_df"] = df
-                st.success("Reclassification lookup loaded.")
-            else:
-                st.error("CSV must contain a column named SWAT_Class_Target.")
-        except Exception as e:
-            st.error(str(e))
-
 
 def _run_preprocessing() -> Dict[str, str]:
     """
@@ -520,7 +655,7 @@ def _run_preprocessing() -> Dict[str, str]:
     do_mosaic = st.session_state["do_mosaic"]
     clip_to_huc = st.session_state["clip_to_huc"]
     huc_gdf = st.session_state.get("huc_boundary")
-    reclass_df = st.session_state.get("reclass_lookup_df")
+    reclass_df = st.session_state.get("edited_lu_table") or st.session_state.get("reclass_lookup_df")
 
     results = {}
 
@@ -600,14 +735,14 @@ def _run_preprocessing() -> Dict[str, str]:
     elif lu_path:
         results["landuse"] = lu_path
 
-    # Lookup CSV
-    if st.session_state.get("land_use_classes_df") is not None:
-        lookup_path = out_dir / "land_use_lookup.csv"
-        st.session_state["land_use_classes_df"].to_csv(lookup_path, index=False)
-        results["lookup_csv"] = str(lookup_path)
-    elif reclass_df is not None:
+    # Lookup CSV (prefer in-app edited table, then extracted classes)
+    if reclass_df is not None:
         lookup_path = out_dir / "land_use_lookup.csv"
         reclass_df.to_csv(lookup_path, index=False)
+        results["lookup_csv"] = str(lookup_path)
+    elif st.session_state.get("land_use_classes_df") is not None:
+        lookup_path = out_dir / "land_use_lookup.csv"
+        st.session_state["land_use_classes_df"].to_csv(lookup_path, index=False)
         results["lookup_csv"] = str(lookup_path)
 
     return results

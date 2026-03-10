@@ -64,6 +64,15 @@ def get_numeric_columns(gdf: gpd.GeoDataFrame) -> list:
     ]
 
 
+def get_text_columns(gdf: gpd.GeoDataFrame) -> list:
+    """Return list of column names that are string/object (excluding geometry), for descriptions."""
+    geom_name = gdf.geometry.name
+    return [
+        c for c in gdf.columns
+        if c != geom_name and not pd.api.types.is_numeric_dtype(gdf[c])
+    ]
+
+
 def load_vector_from_path(path: Path) -> Tuple[gpd.GeoDataFrame, Dict[str, Any]]:
     """Load a vector layer from a path (directory with .shp or path to .shp)."""
     path = Path(path)
