@@ -44,6 +44,31 @@ Exact filenames may vary slightly; the important concepts are the **app**, **spa
 
 ### 1. Create and activate a Python environment
 
-# Example with conda
+Example with conda:
+
+```bash
 conda create -n qswat_inputs python=3.11 -y
 conda activate qswat_inputs
+```
+
+### 2. Install dependencies
+
+From the project root (the folder that contains `app.py`):
+
+```bash
+pip install -r requirements.txt
+```
+
+On Windows, GeoPandas/Rasterio/Fiona sometimes install more reliably from **conda-forge** than from pip alone. If `pip install` fails, install those packages from conda-forge and then install any remaining packages from `requirements.txt`.
+
+---
+
+## Run the app
+
+From the project root:
+
+```bash
+streamlit run app.py
+```
+
+Streamlit prints a local URL (typically [http://localhost:8501](http://localhost:8501)); open it in your browser.
