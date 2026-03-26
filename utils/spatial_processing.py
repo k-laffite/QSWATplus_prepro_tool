@@ -325,6 +325,54 @@ def clip_vector_to_geometry(
     return gpd.clip(gdf, boundary_gdf)
 
 
+def warp_raster_to_template(
+    source_path: str,
+    template_raster_path: str,
+    out_path: Path,
+) -> str:
+    """
+    Resample source raster onto the template raster's grid (transform, shape, CRS).
+    Uses nearest-neighbor resampling (appropriate for soil / categorical IDs).
+    """
+    out_path = Path(out_path)
+    with rasterio.open(template_raster_path) as tpl:
+        dst_transform = tpl.transform
+        dst_crs = tpl.crs
+        dst_w = tpl.width
+        dst_h = tpl.height
+        tpl_meta = tpl.meta.copy()
+
+    with rasterio.open(source_path) as src:
+        nodata_out = src.nodata
+        if nodata_out is None:
+            nodata_out = -9999
+        dst = np.full((dst_h, dst_w), nodata_out, dtype=np.float64)
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dst,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.nearest,
+        )
+        tpl_meta.update({
+            "driver": "GTiff",
+            "height": dst_h,
+            "width": dst_w,
+            "transform": dst_transform,
+            "crs": dst_crs,
+            "count": 1,
+            "dtype": "int32",
+            "nodata": int(nodata_out) if np.isfinite(nodata_out) else -9999,
+        })
+        out_data = np.rint(dst).astype(np.int32)
+        with rasterio.open(out_path, "w", **tpl_meta) as dest:
+            dest.write(out_data, 1)
+
+    return str(out_path)
+
+
 def reproject_raster(
     raster_path: str,
     target_crs: str,
@@ -450,3 +498,194 @@ def reclassify_raster_from_lookup(
         with rasterio.open(out_path, "w", **out_meta) as dest:
             dest.write(out_data, 1)
     return str(out_path)
+
+
+def _pick_ssurgo_mukey_col(df: pd.DataFrame) -> Optional[str]:
+    for c in ("MUKEY", "mukey", "MapUnitKey", "mapunitkey"):
+        if c in df.columns:
+            return c
+    return None
+
+
+def _pick_usersoil_id_col(df: pd.DataFrame) -> Optional[str]:
+    for c in ("MUID", "ID", "SOIL_ID", "id"):
+        if c in df.columns:
+            return c
+    return None
+
+
+def _pick_usersoil_name_col(df: pd.DataFrame) -> Optional[str]:
+    for c in ("SNAM", "Name", "name", "SNAM_USDA"):
+        if c in df.columns:
+            return c
+    return None
+
+
+def _normalize_mukey(val: Any) -> Optional[int]:
+    if pd.isna(val):
+        return None
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return None
+
+
+def apply_field_specific_soil_overlay(
+    soil_raster_path: str,
+    fields_gdf: gpd.GeoDataFrame,
+    ssurgo_df: pd.DataFrame,
+    out_soil_path: Path,
+    out_lookup_csv: Path,
+    out_usersoil_csv: Path,
+) -> Dict[str, Any]:
+    """
+    Rasterize crop field polygons to the soil raster grid, then assign new pixel IDs for each
+    unique (Field_ID, MUKEY) inside fields. Outside fields, keep original soil (MUKEY) values.
+
+    Writes:
+      - Field-specific soil GeoTIFF (int32)
+      - lookup_soil.csv: Raster_Value, Name
+      - usersoil.csv: original SSURGO rows plus duplicated rows for new IDs
+    """
+    out_soil_path = Path(out_soil_path)
+    out_lookup_csv = Path(out_lookup_csv)
+    out_usersoil_csv = Path(out_usersoil_csv)
+
+    mukey_col = _pick_ssurgo_mukey_col(ssurgo_df)
+    id_col = _pick_usersoil_id_col(ssurgo_df)
+    name_col = _pick_usersoil_name_col(ssurgo_df)
+
+    mukey_to_name: Dict[int, str] = {}
+    if name_col is not None:
+        key_col = mukey_col if mukey_col is not None else id_col
+        if key_col is not None:
+            for _, row in ssurgo_df.iterrows():
+                mk = _normalize_mukey(row[key_col])
+                if mk is None:
+                    continue
+                nm = row[name_col]
+                label = str(nm) if pd.notna(nm) else str(mk)
+                if mk not in mukey_to_name:
+                    mukey_to_name[mk] = label
+
+    with rasterio.open(soil_raster_path) as src:
+        soil_arr = src.read(1)
+        transform = src.transform
+        crs = src.crs
+        height, width = src.height, src.width
+        nodata_in = src.nodata
+        meta = src.meta.copy()
+
+    soil_int = np.rint(soil_arr).astype(np.int64, copy=False)
+
+    fg = fields_gdf.copy().reset_index(drop=True)
+    if fg.crs is None:
+        raise ValueError("Crop fields GeoDataFrame must have a CRS set.")
+    if crs is not None and fg.crs != crs:
+        fg = fg.to_crs(crs)
+
+    fg["Field_ID"] = np.arange(1, len(fg) + 1, dtype=np.int32)
+    shapes = [
+        (geom, int(fid))
+        for geom, fid in zip(fg.geometry, fg["Field_ID"])
+        if geom is not None and not geom.is_empty
+    ]
+    field_arr = rasterio_rasterize(
+        shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=0,
+        dtype="int32",
+        all_touched=False,
+    )
+
+    valid_soil = np.ones(soil_arr.shape, dtype=bool)
+    if nodata_in is not None and np.isfinite(nodata_in):
+        valid_soil = soil_arr != nodata_in
+
+    max_mukey = int(np.max(soil_int[valid_soil])) if valid_soil.any() else 0
+    if not valid_soil.any():
+        max_mukey = int(np.max(soil_int)) if soil_int.size else 0
+
+    mask_field = field_arr > 0
+    if not mask_field.any():
+        raise ValueError("No crop field polygons overlap the soil raster extent.")
+
+    f_flat = field_arr[mask_field]
+    s_flat = soil_int[mask_field]
+    pairs = np.column_stack([f_flat, s_flat])
+    unique_pairs = np.unique(pairs, axis=0)
+
+    combo_to_new: Dict[Tuple[int, int], int] = {}
+    next_id = max_mukey + 1
+    for row_pair in unique_pairs:
+        fid, mkey = int(row_pair[0]), int(row_pair[1])
+        combo_to_new[(fid, mkey)] = next_id
+        next_id += 1
+
+    out_arr = soil_int.astype(np.int32, copy=True)
+    for (fid, mkey), new_val in combo_to_new.items():
+        sel = (field_arr == fid) & (soil_int == mkey)
+        out_arr[sel] = np.int32(new_val)
+
+    meta.update({"dtype": "int32", "nodata": nodata_in})
+    with rasterio.open(out_soil_path, "w", **meta) as dest:
+        dest.write(out_arr, 1)
+
+    newid_to_combo = {v: k for k, v in combo_to_new.items()}
+    unique_vals = np.unique(out_arr)
+    lookup_rows = []
+    for v in unique_vals.tolist():
+        if nodata_in is not None and np.isfinite(nodata_in) and int(v) == int(nodata_in):
+            continue
+        vid = int(v)
+        if vid in newid_to_combo:
+            fid, mkey = newid_to_combo[vid]
+            label = f"Field_{fid}_Soil_{mkey}"
+        else:
+            label = mukey_to_name.get(vid, str(vid))
+        lookup_rows.append({"Raster_Value": vid, "Name": label})
+
+    lookup_df = pd.DataFrame(lookup_rows).sort_values("Raster_Value")
+    lookup_df.to_csv(out_lookup_csv, index=False)
+
+    usersoil_out = ssurgo_df.copy()
+    if id_col is None or name_col is None:
+        usersoil_out.to_csv(out_usersoil_csv, index=False)
+        return {
+            "soil_path": str(out_soil_path),
+            "lookup_csv": str(out_lookup_csv),
+            "usersoil_csv": str(out_usersoil_csv),
+            "n_new_combos": len(combo_to_new),
+            "usersoil_note": "ID/Name columns not found; SSURGO table copied without appended rows.",
+        }
+
+    new_rows: List[pd.Series] = []
+    for (fid, mkey), new_id in combo_to_new.items():
+        parent = pd.DataFrame()
+        if mukey_col is not None:
+            mask = ssurgo_df[mukey_col].apply(lambda x: _normalize_mukey(x) == mkey)
+            parent = ssurgo_df.loc[mask]
+        if parent.empty and id_col is not None:
+            mask = ssurgo_df[id_col].apply(lambda x: _normalize_mukey(x) == mkey)
+            parent = ssurgo_df.loc[mask]
+        if parent.empty:
+            continue
+        row = parent.iloc[0].copy()
+        try:
+            row[id_col] = new_id
+        except Exception:
+            row[id_col] = str(new_id)
+        row[name_col] = f"Field_{int(fid)}_Soil_{int(mkey)}"
+        new_rows.append(row)
+
+    if new_rows:
+        usersoil_out = pd.concat([usersoil_out, pd.DataFrame(new_rows)], ignore_index=True)
+    usersoil_out.to_csv(out_usersoil_csv, index=False)
+
+    return {
+        "soil_path": str(out_soil_path),
+        "lookup_csv": str(out_lookup_csv),
+        "usersoil_csv": str(out_usersoil_csv),
+        "n_new_combos": len(combo_to_new),
+    }

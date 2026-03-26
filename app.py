@@ -5,8 +5,9 @@ Sequential workflow:
   1. HUC Watershed Selection
   2. Uploads and Summary (DEM, Land Use, Soil)
   3. Land Use Class Extraction & Export
-  4. Preprocessing Options (CRS, mosaic, clip, reclassification CSV)
-  5. Final Preview and Export
+  4. Advanced Agricultural HRU Definition (optional field-specific soils)
+  5. Preprocessing Options (CRS, mosaic, clip, reclassification CSV)
+  6. Final Preview and Export
 """
 
 import io
@@ -32,6 +33,7 @@ from utils.file_handlers import (
 )
 from utils.map_utils import create_multi_layer_map
 from utils.spatial_processing import (
+    apply_field_specific_soil_overlay,
     ensure_huc_gdb_dir,
     find_and_load_huc,
     get_raster_resolution,
@@ -44,6 +46,7 @@ from utils.spatial_processing import (
     extract_landuse_classes_raster,
     extract_landuse_classes_vector,
     reclassify_raster_from_lookup,
+    warp_raster_to_template,
 )
 
 # Project root (directory containing app.py)
@@ -51,6 +54,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 # Path to SWAT+ land use class codes (used in Step 3 dropdown)
 SWAT_CLASSES_CSV = PROJECT_ROOT / "data" / "swat+_classes" / "swat+_classes.csv"
+
+# SSURGO / usersoil reference (loaded silently for Step 4 field-specific soils)
+SSURGO_SOILS_CSV = PROJECT_ROOT / "data" / "ssurgo_soil_classes" / "SSURGO_Soils.csv"
 
 
 @st.cache_data(ttl=3600)
@@ -74,6 +80,17 @@ def _load_swat_ref() -> Tuple[pd.DataFrame, Dict[str, int], Dict[str, str]]:
         return df, name_to_id, name_to_desc
     except Exception:
         return pd.DataFrame(), {}, {}
+
+
+@st.cache_data(ttl=3600)
+def _load_ssurgo_soils() -> pd.DataFrame:
+    """Load SSURGO usersoil table from bundled CSV (empty DataFrame if missing)."""
+    if not SSURGO_SOILS_CSV.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(SSURGO_SOILS_CSV)
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=3600)
@@ -114,6 +131,9 @@ def init_session_state() -> None:
         "reclassify_landuse_to_swat_id": True,
         "processed_outputs": None,
         "upload_cache_dir": None,
+        "field_specific_soil_path": None,
+        "field_soil_lookup_csv": None,
+        "field_soil_usersoil_csv": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -283,7 +303,7 @@ def step1_huc_section() -> None:
                     st.session_state["huc_metadata"] = None
 
     if st.session_state.get("huc_boundary") is not None:
-        st.info("HUC boundary is loaded and will be used for clipping when enabled in Step 4.")
+        st.info("HUC boundary is loaded and will be used for clipping when enabled in Step 5.")
         if st.button("Clear HUC boundary", key="clear_huc_btn"):
             st.session_state["huc_boundary"] = None
             st.session_state["huc_metadata"] = None
@@ -601,9 +621,125 @@ def step3_landuse_extraction_section() -> None:
         )
 
 
-def step4_preprocessing_options_section() -> None:
-    """Step 4: CRS, mosaic, clip to HUC, Land Use reclassification CSV upload."""
-    st.header("Step 4: Preprocessing Options")
+def step4_advanced_agricultural_hru_section() -> None:
+    """Step 4: Optional field-specific soil HRU raster and usersoil / lookup CSVs."""
+    st.header("Step 4: Advanced Agricultural HRU Definition")
+
+    _ = _load_ssurgo_soils()
+
+    with st.expander("Field-specific soils (optional)", expanded=False):
+        st.markdown(
+            "Upload **crop field** polygons. The app aligns the soil layer to your **first DEM** grid, "
+            "rasterizes fields with a unique **Field_ID**, then assigns new raster IDs for each "
+            "**(Field_ID, MUKEY)** combination inside fields. Background pixels keep original MUKEY values. "
+            "Requires **SSURGO_Soils.csv** at `data/ssurgo_soil_classes/SSURGO_Soils.csv` (loaded automatically)."
+        )
+
+        if not SSURGO_SOILS_CSV.exists():
+            st.warning(
+                f"SSURGO reference not found: `{SSURGO_SOILS_CSV}`. "
+                "Add this file to enable field-specific usersoil generation."
+            )
+
+        crop_files = st.file_uploader(
+            "Crop fields (shapefile .zip or .shp + components)",
+            type=["zip", "shp", "shx", "dbf", "prj"],
+            accept_multiple_files=True,
+            key="crop_fields_uploader",
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            process_fields = st.button("Process Field-Specific Soils", key="process_field_soils_btn")
+        with c2:
+            if st.button("Clear field-specific soil outputs", key="clear_field_soils_btn"):
+                st.session_state["field_specific_soil_path"] = None
+                st.session_state["field_soil_lookup_csv"] = None
+                st.session_state["field_soil_usersoil_csv"] = None
+                st.success("Field-specific soil outputs cleared; preprocessing will use the standard soil layer.")
+                st.rerun()
+
+        if process_fields:
+            ssurgo_df = _load_ssurgo_soils()
+            if ssurgo_df.empty:
+                st.error("SSURGO_Soils.csv is missing or could not be read. Cannot build usersoil / lookup tables.")
+            elif not crop_files:
+                st.error("Upload a crop fields shapefile (.zip or components) first.")
+            else:
+                dem_uploads = st.session_state.get("dem_uploads") or []
+                soil_uploads = st.session_state.get("soil_uploads") or []
+                if not dem_uploads:
+                    st.error("Upload a DEM in Step 2 first (soil is aligned to the DEM grid).")
+                elif not soil_uploads:
+                    st.error("Upload a soil layer in Step 2 first.")
+                else:
+                    cache = Path(st.session_state["upload_cache_dir"])
+                    out_dir = cache / "field_specific"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    dem_path = dem_uploads[0]["path"]
+
+                    try:
+                        saved_cf = _save_uploaded_files(
+                            list(crop_files),
+                            "crop_fields",
+                            (".zip", ".shp", ".shx", ".dbf", ".prj"),
+                        )
+                        if not saved_cf:
+                            st.error("Could not save crop field uploads.")
+                        else:
+                            fields_gdf, _ = load_vector_from_path(Path(saved_cf[0]["path"]))
+                            soil_u = soil_uploads[0]
+                            soil_aligned_path = out_dir / "soil_on_dem.tif"
+
+                            if soil_u.get("metadata", {}).get("type") == "vector":
+                                gdf_soil, _ = load_vector_from_path(Path(soil_u["path"]))
+                                numeric_cols = get_numeric_columns(gdf_soil)
+                                if not numeric_cols:
+                                    st.error("Soil vector has no numeric columns; cannot rasterize MUKEY values.")
+                                else:
+                                    value_col = "MUKEY" if "MUKEY" in numeric_cols else numeric_cols[0]
+                                    rasterize_vector_to_raster(
+                                        gdf_soil,
+                                        value_col,
+                                        soil_aligned_path,
+                                        template_raster_path=dem_path,
+                                    )
+                            else:
+                                src_soil = soil_u.get("rasterized_path") or soil_u["path"]
+                                warp_raster_to_template(src_soil, dem_path, soil_aligned_path)
+
+                            out_soil = out_dir / "soil_field_specific.tif"
+                            out_lookup = out_dir / "lookup_soil.csv"
+                            out_usersoil = out_dir / "usersoil.csv"
+
+                            info = apply_field_specific_soil_overlay(
+                                str(soil_aligned_path),
+                                fields_gdf,
+                                ssurgo_df,
+                                out_soil,
+                                out_lookup,
+                                out_usersoil,
+                            )
+
+                            st.session_state["field_specific_soil_path"] = str(out_soil)
+                            st.session_state["field_soil_lookup_csv"] = str(out_lookup)
+                            st.session_state["field_soil_usersoil_csv"] = str(out_usersoil)
+
+                            note = (info.get("usersoil_note") or "").strip()
+                            msg = (
+                                f"Field-specific soil raster saved "
+                                f"({info.get('n_new_combos', 0)} new field–soil combinations)."
+                            )
+                            if note:
+                                msg += f" {note}"
+                            st.success(msg)
+                    except Exception as e:
+                        st.exception(e)
+
+
+def step5_preprocessing_options_section() -> None:
+    """Step 5: CRS, mosaic, clip to HUC, Land Use reclassification CSV upload."""
+    st.header("Step 5: Preprocessing Options")
 
     # Collect CRS options: common EPSG + from uploaded layers
     crs_options = [
@@ -727,12 +863,24 @@ def _run_preprocessing() -> Dict[str, str]:
     if dem_path:
         results["dem"] = dem_path
 
-    # Soil
-    soil_path = _process_raster_list(
-        st.session_state.get("soil_uploads") or [],
-        "Soil",
-        "soil",
-    )
+    # Soil (optional override from Step 4 field-specific processing)
+    field_soil = st.session_state.get("field_specific_soil_path")
+    if field_soil and Path(field_soil).exists():
+        fake_soil_uploads = [
+            {
+                "path": field_soil,
+                "name": "soil_field_specific.tif",
+                "metadata": {"type": "raster"},
+                "rasterized_path": None,
+            }
+        ]
+        soil_path = _process_raster_list(fake_soil_uploads, "Soil", "soil")
+    else:
+        soil_path = _process_raster_list(
+            st.session_state.get("soil_uploads") or [],
+            "Soil",
+            "soil",
+        )
     if soil_path:
         results["soil"] = soil_path
 
@@ -778,12 +926,24 @@ def _run_preprocessing() -> Dict[str, str]:
         st.session_state["land_use_classes_df"].to_csv(lookup_path, index=False)
         results["lookup_csv"] = str(lookup_path)
 
+    lk_soil = st.session_state.get("field_soil_lookup_csv")
+    if lk_soil and Path(lk_soil).exists():
+        dst = out_dir / "lookup_soil.csv"
+        shutil.copy(lk_soil, dst)
+        results["lookup_soil_csv"] = str(dst)
+
+    us_soil = st.session_state.get("field_soil_usersoil_csv")
+    if us_soil and Path(us_soil).exists():
+        dst_u = out_dir / "usersoil.csv"
+        shutil.copy(us_soil, dst_u)
+        results["usersoil_csv"] = str(dst_u)
+
     return results
 
 
-def step5_final_preview_section() -> None:
-    """Step 5: Run Preprocessing, final map, download ZIP."""
-    st.header("Step 5: Final Preview and Export")
+def step6_final_preview_section() -> None:
+    """Step 6: Run Preprocessing, final map, download ZIP."""
+    st.header("Step 6: Final Preview and Export")
 
     if st.button("Run Preprocessing", type="primary", key="run_preprocessing_btn"):
         with st.spinner("Running preprocessing…"):
@@ -801,7 +961,12 @@ def step5_final_preview_section() -> None:
         layers_for_map = []
         huc_gdf = st.session_state.get("huc_boundary")
         for key, path in outputs.items():
-            if key in ("lookup_csv", "swat_landuse_lookup_csv"):
+            if key in (
+                "lookup_csv",
+                "swat_landuse_lookup_csv",
+                "lookup_soil_csv",
+                "usersoil_csv",
+            ):
                 continue
             path = Path(path)
             if path.suffix.lower() in (".tif", ".tiff"):
@@ -853,7 +1018,8 @@ def main() -> None:
     st.title("QSWAT+ Inputs Preprocessor")
     st.markdown(
         "Follow the steps below: select an optional HUC, upload DEM/Land Use/Soil, "
-        "extract land use classes, set options, then run preprocessing and download."
+        "extract land use classes, optionally define field-specific soils, set options, "
+        "then run preprocessing and download."
     )
 
     step1_huc_section()
@@ -862,9 +1028,11 @@ def main() -> None:
     st.markdown("---")
     step3_landuse_extraction_section()
     st.markdown("---")
-    step4_preprocessing_options_section()
+    step4_advanced_agricultural_hru_section()
     st.markdown("---")
-    step5_final_preview_section()
+    step5_preprocessing_options_section()
+    st.markdown("---")
+    step6_final_preview_section()
 
 
 if __name__ == "__main__":
