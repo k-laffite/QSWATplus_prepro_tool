@@ -28,6 +28,7 @@ from utils.file_handlers import (
     get_numeric_columns,
     get_text_columns,
     load_raster,
+    load_table,
     load_vector_from_path,
     load_vector_from_zip,
 )
@@ -47,6 +48,7 @@ from utils.spatial_processing import (
     extract_landuse_classes_vector,
     reclassify_raster_from_lookup,
     warp_raster_to_template,
+    warp_raster_to_template_grid,
 )
 
 # Project root (directory containing app.py)
@@ -134,6 +136,12 @@ def init_session_state() -> None:
         "field_specific_soil_path": None,
         "field_soil_lookup_csv": None,
         "field_soil_usersoil_csv": None,
+        "vector_soil_id_col": None,
+        "soil_mukey_map": None,
+        "soil_true_id_col": None,
+        "soil_pixel_value_col": None,
+        "merge_raster_debug_landuse_uploads": None,
+        "merge_raster_debug_soil_uploads": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -173,6 +181,12 @@ def _save_uploaded_files(
     shapefile_groups: Dict[str, List[Any]] = defaultdict(list)
     zips = []
     tifs = []
+    table_sidecars: Dict[str, List[Any]] = defaultdict(list)
+    shp_stems = {
+        Path(uf.name).stem
+        for uf in uploaded_files
+        if Path(uf.name).suffix.lower() == ".shp"
+    }
     for uf in uploaded_files:
         name = uf.name
         suffix = Path(name).suffix.lower()
@@ -183,7 +197,12 @@ def _save_uploaded_files(
         elif suffix in (".tif", ".tiff"):
             tifs.append(uf)
         elif suffix in vector_extensions:
-            shapefile_groups[Path(name).stem].append(uf)
+            if suffix == ".dbf" and Path(name).stem not in shp_stems:
+                table_sidecars[Path(name).stem].append(uf)
+            else:
+                shapefile_groups[Path(name).stem].append(uf)
+        elif suffix == ".csv":
+            table_sidecars[Path(name).stem].append(uf)
 
     results = []
     idx = 0
@@ -196,11 +215,24 @@ def _save_uploaded_files(
                 extract_dir = layer_dir / f"{idx}_extracted"
                 extract_dir.mkdir(exist_ok=True)
                 zf.extractall(extract_dir)
-            gdf, meta = load_vector_from_path(extract_dir)
-            meta["path"] = str(extract_dir)
-            meta["name"] = name
-            meta["resolution"] = None
-            results.append({"path": str(extract_dir), "name": name, "metadata": meta})
+            shp_files = sorted(extract_dir.rglob("*.shp"))
+            if not shp_files:
+                raise FileNotFoundError("No .shp file found in the uploaded ZIP.")
+            for shp_idx, shp_path in enumerate(shp_files):
+                gdf, meta = load_vector_from_path(shp_path)
+                rel_name = shp_path.relative_to(extract_dir)
+                meta["path"] = str(shp_path)
+                meta["name"] = f"{name} :: {rel_name}"
+                meta["resolution"] = None
+                results.append(
+                    {
+                        "path": str(shp_path),
+                        "name": meta["name"],
+                        "metadata": meta,
+                        "source_zip": name,
+                        "zip_member": str(rel_name),
+                    }
+                )
         except Exception as e:
             st.warning(f"Could not load {name}: {e}")
         idx += 1
@@ -212,7 +244,29 @@ def _save_uploaded_files(
         try:
             _, meta = load_raster(path)
             meta["name"] = name
-            results.append({"path": str(path), "name": name, "metadata": meta})
+            stem = Path(name).stem
+            vat_table_path = None
+            vat_table_format = None
+            matching_sidecars = list(table_sidecars.get(stem, []))
+            if not matching_sidecars:
+                for sidecar_stem, sidecars in table_sidecars.items():
+                    if sidecar_stem.startswith(stem):
+                        matching_sidecars.extend(sidecars)
+            for sidecar in matching_sidecars:
+                sidecar_path = layer_dir / f"{idx}_{sidecar.name}"
+                sidecar_path.write_bytes(sidecar.getbuffer())
+                if sidecar_path.suffix.lower() in (".csv", ".dbf") and vat_table_path is None:
+                    vat_table_path = str(sidecar_path)
+                    vat_table_format = sidecar_path.suffix.lower().lstrip(".")
+            results.append(
+                {
+                    "path": str(path),
+                    "name": name,
+                    "metadata": meta,
+                    "vat_table_path": vat_table_path,
+                    "vat_table_format": vat_table_format,
+                }
+            )
         except Exception as e:
             st.warning(f"Could not load {name}: {e}")
         idx += 1
@@ -252,6 +306,50 @@ def _upload_fingerprint(uploaded_files: List[Any]) -> Optional[tuple]:
 def _cached_load_vector_from_path(_path_str: str) -> Tuple[Any, Dict[str, Any]]:
     """Load vector from path; cached by path string to avoid re-reading on every rerun."""
     return load_vector_from_path(Path(_path_str))
+
+
+@st.cache_data(ttl=3600)
+def _cached_load_table(_path_str: str) -> pd.DataFrame:
+    """Load CSV/DBF attribute table; cached by path string."""
+    path = Path(_path_str)
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        df, _ = load_table(path)
+        return df
+    if suffix == ".dbf":
+        gdf = gpd.read_file(path)
+        if "geometry" in gdf.columns:
+            gdf = gdf.drop(columns=["geometry"])
+        return pd.DataFrame(gdf)
+    raise ValueError(f"Unsupported VAT table format: {path.suffix}")
+
+
+def _find_case_insensitive_column(columns: List[str], target: str) -> Optional[str]:
+    target_lower = target.lower()
+    for col in columns:
+        if str(col).lower() == target_lower:
+            return col
+    return None
+
+
+def _combine_vector_uploads(vector_uploads: List[Dict[str, Any]]) -> gpd.GeoDataFrame:
+    """Merge multiple vector uploads into one GeoDataFrame, aligning CRS to the first layer."""
+    if not vector_uploads:
+        raise ValueError("No vector uploads were provided.")
+
+    merged_parts: List[gpd.GeoDataFrame] = []
+    target_crs = None
+    for upload in vector_uploads:
+        gdf, _ = load_vector_from_path(Path(upload["path"]))
+        if target_crs is None:
+            target_crs = gdf.crs
+        elif gdf.crs is not None and target_crs is not None and gdf.crs != target_crs:
+            gdf = gdf.to_crs(target_crs)
+        merged_parts.append(gdf)
+
+    merged_df = pd.concat(merged_parts, ignore_index=True, sort=False)
+    merged_gdf = gpd.GeoDataFrame(merged_df, geometry="geometry", crs=target_crs or merged_parts[0].crs)
+    return merged_gdf
 
 
 def _get_layer_data_for_map(entry: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
@@ -317,31 +415,32 @@ def step2_uploads_section() -> None:
     st.markdown(
         "Upload one or more files per layer (e.g. multiple DEM tiles). "
         "**Rasters:** GeoTIFF (`.tif`). **Vectors:** zipped Shapefile (`.zip`) or components (`.shp`, `.shx`, `.dbf`, `.prj`). "
-        "Vector Land Use/Soil layers can be rasterized to match the DEM grid below."
+        "Vector Land Use/Soil layers can be merged and rasterized to match the DEM grid below."
     )
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        dem_files = st.file_uploader(
-            "DEM (raster)",
-            type=["tif", "tiff"],
-            accept_multiple_files=True,
-            key="dem_uploader",
-        )
-    with col2:
-        landuse_files = st.file_uploader(
-            "Land Use (raster or vector)",
-            type=["tif", "tiff", "zip"],
-            accept_multiple_files=True,
-            key="landuse_uploader",
-        )
-    with col3:
-        soil_files = st.file_uploader(
-            "Soil Map (raster or vector)",
-            type=["tif", "tiff", "zip"],
-            accept_multiple_files=True,
-            key="soil_uploader",
-        )
+    st.subheader("DEM")
+    dem_files = st.file_uploader(
+        "DEM (raster)",
+        type=["tif", "tiff"],
+        accept_multiple_files=True,
+        key="dem_uploader",
+    )
+
+    st.subheader("Land Use")
+    landuse_files = st.file_uploader(
+        "Land Use (raster or vector)",
+        type=["tif", "tiff", "zip", "shp", "shx", "dbf", "prj"],
+        accept_multiple_files=True,
+        key="landuse_uploader",
+    )
+
+    st.subheader("Soil")
+    soil_files = st.file_uploader(
+        "Soil Map (raster or vector)",
+        type=["tif", "tiff", "zip", "shp", "shx", "dbf", "prj", "csv"],
+        accept_multiple_files=True,
+        key="soil_uploader",
+    )
 
     # Persist uploads only when the set of files actually changed (preserves rasterized_path etc.)
     dem_fp = _upload_fingerprint(dem_files)
@@ -367,111 +466,325 @@ def step2_uploads_section() -> None:
     if soil_fp is not None and st.session_state.get("last_soil_fingerprint") != soil_fp:
         st.session_state["soil_uploads"] = _save_uploaded_files(
             soil_files, "soil",
-            (".tif", ".tiff", ".zip", ".shp", ".shx", ".dbf", ".prj"),
+            (".tif", ".tiff", ".zip", ".shp", ".shx", ".dbf", ".prj", ".csv"),
         )
         st.session_state["last_soil_fingerprint"] = soil_fp
     if soil_fp is None:
         st.session_state["last_soil_fingerprint"] = None
 
-    # Vector attribute selection and rasterization for Land Use / Soil
     cache_dir = Path(st.session_state["upload_cache_dir"])
     dem_uploads = st.session_state.get("dem_uploads") or []
     template_dem_path = dem_uploads[0]["path"] if dem_uploads else None
 
-    for label, layer_key in [("Land Use", "landuse_uploads"), ("Soil", "soil_uploads")]:
+    def _render_vector_processing_section(label: str, layer_key: str) -> None:
         uploads = st.session_state.get(layer_key) or []
-        for i, u in enumerate(uploads):
-            meta = u.get("metadata", {})
-            if meta.get("type") != "vector":
-                continue
-            gdf, _ = _cached_load_vector_from_path(u["path"])
-            numeric_cols = get_numeric_columns(gdf)
+        vector_uploads = [u for u in uploads if u.get("metadata", {}).get("type") == "vector"]
+        if not vector_uploads:
+            return
+
+        st.markdown(f"#### {label} Vector Processing")
+        st.info(f"Detected {len(vector_uploads)} shapefile(s) for {label}.")
+        if len(vector_uploads) > 1:
+            with st.expander(f"Detected {label} shapefiles", expanded=False):
+                for u in vector_uploads:
+                    st.write(f"- `{u['name']}`")
+
+        merge_key = f"merge_all_{layer_key}"
+        merge_all = st.checkbox(
+            f"Merge all detected {label} shapefiles before rasterizing",
+            value=len(vector_uploads) > 1,
+            key=merge_key,
+        )
+
+        source_uploads = vector_uploads
+        source_label = f"{len(vector_uploads)} merged shapefile(s)"
+        if not merge_all and len(vector_uploads) > 1:
+            selected_name = st.selectbox(
+                f"Select which {label} shapefile to use",
+                options=[u["name"] for u in vector_uploads],
+                key=f"selected_{layer_key}_vector_name",
+            )
+            source_uploads = [next(u for u in vector_uploads if u["name"] == selected_name)]
+            source_label = selected_name
+        elif len(vector_uploads) == 1:
+            source_label = vector_uploads[0]["name"]
+
+        try:
+            source_gdf = (
+                _combine_vector_uploads(source_uploads)
+                if len(source_uploads) > 1
+                else load_vector_from_path(Path(source_uploads[0]["path"]))[0]
+            )
+        except Exception as ex:
+            st.error(f"Could not load {label} vector source(s): {ex}")
+            return
+
+        if label == "Soil":
+            soil_cols = [c for c in source_gdf.columns if c != source_gdf.geometry.name]
+            if not soil_cols:
+                st.warning("Soil source has no non-geometry columns; cannot rasterize.")
+                return
+            default_soil_col = _find_case_insensitive_column(soil_cols, "MUKEY") or soil_cols[0]
+            soil_id_col = st.selectbox(
+                "Select the column containing the true Soil ID (e.g., MUKEY)",
+                options=soil_cols,
+                index=soil_cols.index(default_soil_col),
+                key="vector_soil_id_col_select",
+            )
+            value_col = soil_id_col
+            st.session_state["vector_soil_id_col"] = soil_id_col
+            st.session_state["soil_true_id_col"] = soil_id_col
+            st.session_state["soil_mukey_map"] = None
+            st.session_state["soil_pixel_value_col"] = None
+            desc_col = None
+            converted_soil_vals = pd.to_numeric(source_gdf[value_col], errors="coerce")
+            if converted_soil_vals.isna().all():
+                st.warning(
+                    "The selected Soil ID column cannot be converted to numeric values for rasterization."
+                )
+                return
+        else:
+            numeric_cols = get_numeric_columns(source_gdf)
             if not numeric_cols:
-                st.warning(f"**{label}** layer «{u['name']}» has no numeric columns; cannot rasterize.")
-                continue
+                st.warning(f"{label} source has no numeric columns; cannot rasterize.")
+                return
             default_ix = numeric_cols.index("GRIDCODE") if "GRIDCODE" in numeric_cols else 0
-            col = st.selectbox(
-                f"Select the numeric column to use for raster values — {label}: {u['name']}",
+            value_col = st.selectbox(
+                f"Select the numeric column to use for raster values — {label}",
                 options=numeric_cols,
                 index=default_ix,
-                key=f"vec_col_{layer_key}_{i}",
+                key=f"vec_col_{layer_key}",
             )
-
-            text_cols = get_text_columns(gdf)
+            text_cols = get_text_columns(source_gdf)
             desc_options = ["None"] + text_cols
             desc_col = st.selectbox(
                 "Select the column containing Land Use descriptions (optional)",
                 options=desc_options,
                 index=0,
-                key=f"vec_desc_col_{layer_key}_{i}",
+                key=f"vec_desc_col_{layer_key}",
             )
 
-            res_method = st.radio(
-                "Select Resolution Method",
-                options=["Match uploaded DEM", "Provide custom resolution"],
-                key=f"vec_res_method_{layer_key}_{i}",
-                horizontal=True,
-            )
+        res_method = st.radio(
+            f"Select {label} rasterization method",
+            options=["Match uploaded DEM resolution and grid", "Provide custom resolution"],
+            key=f"vec_res_method_{layer_key}",
+            horizontal=True,
+        )
 
-            template_path = None
-            target_res = None
-            can_rasterize = False
-
-            if res_method == "Match uploaded DEM":
-                if template_dem_path:
-                    template_path = template_dem_path
-                    can_rasterize = True
-                else:
-                    st.warning(
-                        "Please upload a DEM first, or choose a custom resolution."
-                    )
-                    can_rasterize = False
-            else:
-                target_res = st.number_input(
-                    "Cell Size (in map units)",
-                    min_value=0.1,
-                    value=30.0,
-                    step=1.0,
-                    key=f"vec_res_{layer_key}_{i}",
-                    help="Resolution used to build the output grid from the shapefile extent.",
-                )
+        template_path = None
+        target_res = None
+        can_rasterize = False
+        if res_method == "Match uploaded DEM resolution and grid":
+            if template_dem_path:
+                template_path = template_dem_path
                 can_rasterize = True
-
-            convert_clicked = st.button(
-                "Convert to Raster",
-                key=f"convert_btn_{layer_key}_{i}",
-                disabled=not (col and can_rasterize and (template_path or target_res is not None)),
+                st.caption(
+                    "Uses the DEM CRS and cell size, snaps to the DEM grid, and expands to cover the full vector extent."
+                )
+            else:
+                st.warning("Please upload a DEM first, or choose a custom resolution.")
+        else:
+            target_res = st.number_input(
+                f"{label} cell size (in map units)",
+                min_value=0.1,
+                value=30.0,
+                step=1.0,
+                key=f"vec_res_{layer_key}",
+                help="Resolution used to build the output grid from the shapefile extent.",
             )
-            if convert_clicked and col and can_rasterize and (template_path or target_res is not None):
-                layer_dir = cache_dir / layer_key
-                layer_dir.mkdir(parents=True, exist_ok=True)
-                out_path = layer_dir / f"rasterized_{i}.tif"
-                try:
+            can_rasterize = True
+
+        convert_clicked = st.button(
+            f"Convert {label} to Raster",
+            key=f"convert_btn_{layer_key}",
+            disabled=not (value_col and can_rasterize and (template_path or target_res is not None)),
+        )
+
+        if convert_clicked:
+            layer_dir = cache_dir / layer_key
+            layer_dir.mkdir(parents=True, exist_ok=True)
+            out_path = layer_dir / f"{layer_key}_combined_raster.tif"
+            try:
+                if merge_all and len(source_uploads) > 1:
+                    debug_rows = []
+                    for part_idx, part_upload in enumerate(source_uploads):
+                        part_gdf, _ = load_vector_from_path(Path(part_upload["path"]))
+                        bounds = part_gdf.total_bounds
+                        debug_rows.append(
+                            {
+                                "Part": part_idx,
+                                "Source Name": part_upload["name"],
+                                "Source Path": part_upload["path"],
+                                "Zip Member": part_upload.get("zip_member", ""),
+                                "Bounds Left": float(bounds[0]),
+                                "Bounds Bottom": float(bounds[1]),
+                                "Bounds Right": float(bounds[2]),
+                                "Bounds Top": float(bounds[3]),
+                                "Feature Count": int(len(part_gdf)),
+                            }
+                        )
+                    st.session_state[f"merge_raster_debug_{layer_key}"] = debug_rows
                     rasterize_vector_to_raster(
-                        gdf,
-                        col,
+                        source_gdf,
+                        value_col,
                         out_path,
                         template_raster_path=template_path,
                         target_resolution=target_res if not template_path else None,
                     )
-                    _, rmeta = load_raster(out_path)
-                    rmeta["name"] = u["name"]
-                    u["rasterized_path"] = str(out_path)
-                    u["raster_metadata"] = rmeta
-                    if label == "Land Use" and desc_col and desc_col != "None":
+                else:
+                    st.session_state[f"merge_raster_debug_{layer_key}"] = None
+                    rasterize_vector_to_raster(
+                        source_gdf,
+                        value_col,
+                        out_path,
+                        template_raster_path=template_path,
+                        target_resolution=target_res if not template_path else None,
+                    )
+                _, rmeta = load_raster(out_path)
+                rmeta["name"] = f"{label} rasterized from {source_label}"
+                generated_upload = {
+                    "path": str(out_path),
+                    "name": rmeta["name"],
+                    "metadata": rmeta,
+                    "generated_from_vectors": True,
+                }
+                non_generated = [u for u in uploads if not u.get("generated_from_vectors")]
+                st.session_state[layer_key] = [generated_upload] + non_generated
+
+                if label == "Land Use" and desc_col and desc_col != "None":
+                    mapping = {}
+                    for val in source_gdf[value_col].drop_duplicates():
+                        try:
+                            v = int(val) if pd.notna(val) else None
+                            if v is not None:
+                                desc = source_gdf.loc[source_gdf[value_col] == val, desc_col].iloc[0]
+                                mapping[v] = str(desc) if pd.notna(desc) else ""
+                        except (ValueError, TypeError):
+                            pass
+                    st.session_state["lu_desc_mapping"] = mapping
+
+                st.success(f"Rasterized {label} from {source_label}.")
+                st.rerun()
+            except Exception as ex:
+                st.error(f"Rasterization failed for {label}: {ex}")
+
+        debug_rows = st.session_state.get(f"merge_raster_debug_{layer_key}")
+        if debug_rows:
+            st.caption(f"{label} merge-all rasterization debug")
+            st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, hide_index=True)
+
+    _render_vector_processing_section("Land Use", "landuse_uploads")
+    _render_vector_processing_section("Soil", "soil_uploads")
+
+    st.subheader("Active source summary")
+
+    def _describe_active_source(label: str, layer_key: str) -> None:
+        uploads = st.session_state.get(layer_key) or []
+        if not uploads:
+            st.caption(f"{label} source: no layer uploaded.")
+            return
+
+        active = uploads[0]
+        meta = active.get("raster_metadata") or active.get("metadata") or {}
+
+        if active.get("generated_from_vectors"):
+            st.caption(f"{label} source: rasterized output from `{active['name']}`.")
+            return
+
+        if meta.get("type") == "raster":
+            if active.get("vat_table_path"):
+                st.caption(
+                    f"{label} source: raster `{active['name']}` with VAT mapping "
+                    f"from `{Path(active['vat_table_path']).name}`."
+                )
+            else:
+                st.caption(f"{label} source: raster `{active['name']}`.")
+            return
+
+        vector_uploads = [u for u in uploads if u.get("metadata", {}).get("type") == "vector"]
+        if not vector_uploads:
+            st.caption(f"{label} source: `{active['name']}`.")
+            return
+
+        if len(vector_uploads) == 1:
+            st.caption(f"{label} source: vector `{vector_uploads[0]['name']}`.")
+            return
+
+        merge_all = st.session_state.get(f"merge_all_{layer_key}", len(vector_uploads) > 1)
+        if merge_all:
+            st.caption(f"{label} source: {len(vector_uploads)} merged shapefiles.")
+        else:
+            selected_name = st.session_state.get(f"selected_{layer_key}_vector_name", vector_uploads[0]["name"])
+            st.caption(f"{label} source: selected shapefile `{selected_name}`.")
+
+    _describe_active_source("DEM", "dem_uploads")
+    _describe_active_source("Land Use", "landuse_uploads")
+    _describe_active_source("Soil", "soil_uploads")
+
+    soil_uploads = st.session_state.get("soil_uploads") or []
+    if soil_uploads:
+        soil_vector_uploads = [u for u in soil_uploads if u.get("metadata", {}).get("type") == "vector"]
+        if soil_vector_uploads:
+            st.caption("Soil vector ID selection is configured in the Soil vector processing section above.")
+        else:
+            st.subheader("Soil ID configuration")
+            soil_u = soil_uploads[0]
+            soil_meta = soil_u.get("metadata", {})
+            if soil_u.get("vat_table_path"):
+                try:
+                    vat_df = _cached_load_table(soil_u["vat_table_path"])
+                    vat_cols = list(vat_df.columns)
+                    if vat_cols:
+                        default_true_id = _find_case_insensitive_column(vat_cols, "MUKEY") or vat_cols[0]
+                        true_id_col = st.selectbox(
+                            "Select the column containing the true Soil ID (e.g., MUKEY)",
+                            options=vat_cols,
+                            index=vat_cols.index(default_true_id),
+                            key="soil_true_id_col_select",
+                        )
+                        default_pixel_col = (
+                            _find_case_insensitive_column(vat_cols, "VALUE")
+                            or _find_case_insensitive_column(vat_cols, "VALUE_1")
+                            or _find_case_insensitive_column(vat_cols, "COUNTYVALUE")
+                            or vat_cols[0]
+                        )
+                        pixel_val_col = st.selectbox(
+                            "Select the column containing the raster pixel values",
+                            options=vat_cols,
+                            index=vat_cols.index(default_pixel_col),
+                            key="soil_pixel_value_col_select",
+                        )
+                        st.session_state["soil_true_id_col"] = true_id_col
+                        st.session_state["soil_pixel_value_col"] = pixel_val_col
+                        st.session_state["vector_soil_id_col"] = None
+                        map_df = vat_df[[pixel_val_col, true_id_col]].dropna().copy()
                         mapping = {}
-                        for val in gdf[col].drop_duplicates():
+                        for _, row in map_df.iterrows():
                             try:
-                                v = int(val) if pd.notna(val) else None
-                                if v is not None:
-                                    desc = gdf.loc[gdf[col] == val, desc_col].iloc[0]
-                                    mapping[v] = str(desc) if pd.notna(desc) else ""
-                            except (ValueError, TypeError):
-                                pass
-                        st.session_state["lu_desc_mapping"] = mapping
-                    st.success(f"Rasterized {u['name']}.")
+                                mapping[int(float(row[pixel_val_col]))] = int(float(row[true_id_col]))
+                            except (TypeError, ValueError):
+                                continue
+                        st.session_state["soil_mukey_map"] = mapping
+                        if mapping:
+                            st.caption(f"Loaded {len(mapping)} raster pixel-to-soil-ID mappings from the Soil VAT.")
+                        else:
+                            st.warning("No valid pixel value to Soil ID mappings were found in the Soil VAT.")
+                    else:
+                        st.warning("The uploaded Soil VAT contains no columns.")
+                        st.session_state["soil_mukey_map"] = None
+                        st.session_state["soil_true_id_col"] = None
+                        st.session_state["soil_pixel_value_col"] = None
                 except Exception as ex:
-                    st.error(f"Rasterization failed for {u['name']}: {ex}")
+                    st.warning(f"Could not read the Soil VAT sidecar: {ex}")
+                    st.session_state["soil_mukey_map"] = None
+                    st.session_state["soil_true_id_col"] = None
+                    st.session_state["soil_pixel_value_col"] = None
+            elif soil_meta.get("type") == "raster":
+                st.info("No Soil attribute table detected. Raster pixel values will be treated as the true Soil IDs.")
+                st.session_state["vector_soil_id_col"] = None
+                st.session_state["soil_mukey_map"] = None
+                st.session_state["soil_true_id_col"] = None
+                st.session_state["soil_pixel_value_col"] = None
 
     # Summary table: Layer Name, Type, CRS, Resolution
     st.subheader("Upload summary")
@@ -493,12 +806,22 @@ def step2_uploads_section() -> None:
     else:
         st.info("No layers uploaded yet.")
 
-    # Map preview: all layers + HUC
+    # Map preview: prefer generated rasters / native rasters and avoid sending all raw vectors
     st.subheader("Map preview (all layers)")
     layers_for_map = []
     for label, key in [("DEM", "dem_uploads"), ("Land Use", "landuse_uploads"), ("Soil", "soil_uploads")]:
         uploads = st.session_state.get(key) or []
+        has_raster_preview = any(
+            u.get("rasterized_path") or u.get("metadata", {}).get("type") == "raster"
+            for u in uploads
+        )
+        raw_vector_added = False
         for u in uploads:
+            meta = u.get("raster_metadata") or u.get("metadata", {})
+            if meta.get("type") == "vector":
+                if has_raster_preview or raw_vector_added:
+                    continue
+                raw_vector_added = True
             data, meta = _get_layer_data_for_map(u)
             layers_for_map.append((data, meta, f"{label}: {u['name']}"))
 
@@ -675,66 +998,125 @@ def step4_advanced_agricultural_hru_section() -> None:
                 else:
                     cache = Path(st.session_state["upload_cache_dir"])
                     out_dir = cache / "field_specific"
-                    out_dir.mkdir(parents=True, exist_ok=True)
                     dem_path = dem_uploads[0]["path"]
 
-                    try:
-                        saved_cf = _save_uploaded_files(
-                            list(crop_files),
-                            "crop_fields",
-                            (".zip", ".shp", ".shx", ".dbf", ".prj"),
-                        )
-                        if not saved_cf:
-                            st.error("Could not save crop field uploads.")
-                        else:
-                            fields_gdf, _ = load_vector_from_path(Path(saved_cf[0]["path"]))
-                            soil_u = soil_uploads[0]
-                            soil_aligned_path = out_dir / "soil_on_dem.tif"
+                    success_msg: Optional[str] = None
+                    with st.status(
+                        "Processing field-specific soils…",
+                        expanded=True,
+                    ) as proc_status:
+                        try:
+                            st.write("**Step 1/5** — Preparing workspace…")
+                            out_dir.mkdir(parents=True, exist_ok=True)
 
-                            if soil_u.get("metadata", {}).get("type") == "vector":
-                                gdf_soil, _ = load_vector_from_path(Path(soil_u["path"]))
-                                numeric_cols = get_numeric_columns(gdf_soil)
-                                if not numeric_cols:
-                                    st.error("Soil vector has no numeric columns; cannot rasterize MUKEY values.")
-                                else:
-                                    value_col = "MUKEY" if "MUKEY" in numeric_cols else numeric_cols[0]
-                                    rasterize_vector_to_raster(
-                                        gdf_soil,
-                                        value_col,
-                                        soil_aligned_path,
-                                        template_raster_path=dem_path,
-                                    )
+                            st.write("**Step 2/5** — Saving crop field uploads and loading polygons…")
+                            saved_cf = _save_uploaded_files(
+                                list(crop_files),
+                                "crop_fields",
+                                (".zip", ".shp", ".shx", ".dbf", ".prj"),
+                            )
+                            if not saved_cf:
+                                proc_status.update(
+                                    label="Stopped: could not save crop field uploads.",
+                                    state="error",
+                                )
+                                st.error("Could not save crop field uploads.")
                             else:
-                                src_soil = soil_u.get("rasterized_path") or soil_u["path"]
-                                warp_raster_to_template(src_soil, dem_path, soil_aligned_path)
+                                fields_gdf, _ = load_vector_from_path(Path(saved_cf[0]["path"]))
+                                soil_u = soil_uploads[0]
+                                soil_aligned_path = out_dir / "soil_on_dem.tif"
+                                soil_ready = False
+                                soil_meta = soil_u.get("raster_metadata") or soil_u.get("metadata") or {}
 
-                            out_soil = out_dir / "soil_field_specific.tif"
-                            out_lookup = out_dir / "lookup_soil.csv"
-                            out_usersoil = out_dir / "usersoil.csv"
+                                st.write("**Step 2.5/5** — Step 4 source diagnostics…")
+                                source_rows = [
+                                    {
+                                        "Selected Soil Source Name": soil_u.get("name", ""),
+                                        "Selected Soil Source Path": soil_u.get("path", ""),
+                                        "Selected Soil Source Type": soil_meta.get("type", ""),
+                                        "Selected Soil Source CRS": soil_meta.get("crs", ""),
+                                        "Selected Soil Source Resolution": soil_meta.get("resolution", ""),
+                                        "Rasterized Path": soil_u.get("rasterized_path", ""),
+                                        "VAT Table Path": soil_u.get("vat_table_path", ""),
+                                        "Vector Soil ID Column": st.session_state.get("vector_soil_id_col", ""),
+                                    }
+                                ]
+                                st.dataframe(pd.DataFrame(source_rows), use_container_width=True, hide_index=True)
 
-                            info = apply_field_specific_soil_overlay(
-                                str(soil_aligned_path),
-                                fields_gdf,
-                                ssurgo_df,
-                                out_soil,
-                                out_lookup,
-                                out_usersoil,
+                                st.write(
+                                    "**Step 3/5** — Aligning soil to the DEM grid "
+                                    "(rasterize or warp; may take a while on large rasters)…"
+                                )
+                                if soil_u.get("metadata", {}).get("type") == "vector":
+                                    gdf_soil, _ = load_vector_from_path(Path(soil_u["path"]))
+                                    soil_id_col = st.session_state.get("vector_soil_id_col")
+                                    if not soil_id_col or soil_id_col not in gdf_soil.columns:
+                                        proc_status.update(
+                                            label="Stopped: choose a valid true Soil ID column for the Soil vector.",
+                                            state="error",
+                                        )
+                                        st.error(
+                                            "Select a valid true Soil ID column for the Soil vector in Step 2."
+                                        )
+                                    else:
+                                        rasterize_vector_to_raster(
+                                            gdf_soil,
+                                            soil_id_col,
+                                            soil_aligned_path,
+                                            template_raster_path=dem_path,
+                                        )
+                                        soil_ready = True
+                                else:
+                                    src_soil = soil_u.get("rasterized_path") or soil_u["path"]
+                                    warp_raster_to_template_grid(src_soil, dem_path, soil_aligned_path)
+                                    soil_ready = True
+
+                                if soil_ready:
+                                    st.write(
+                                        "**Step 4/5** — Rasterizing field polygons, overlaying MUKEYs, "
+                                        "and building lookup / usersoil tables…"
+                                    )
+                                    out_soil = out_dir / "soil_field_specific.tif"
+                                    out_lookup = out_dir / "lookup_soil.csv"
+                                    out_usersoil = out_dir / "usersoil.csv"
+
+                                    info = apply_field_specific_soil_overlay(
+                                        str(soil_aligned_path),
+                                        fields_gdf,
+                                        ssurgo_df,
+                                        out_soil,
+                                        out_lookup,
+                                        out_usersoil,
+                                        soil_id_map=st.session_state.get("soil_mukey_map"),
+                                    )
+
+                                    st.write("**Step 5/5** — Registering outputs for export…")
+                                    st.session_state["field_specific_soil_path"] = str(out_soil)
+                                    st.session_state["field_soil_lookup_csv"] = str(out_lookup)
+                                    st.session_state["field_soil_usersoil_csv"] = str(out_usersoil)
+
+                                    n_combo = info.get("n_new_combos", 0)
+                                    note = (info.get("usersoil_note") or "").strip()
+                                    success_msg = (
+                                        f"Field-specific soil raster saved ({n_combo} new field–soil combinations)."
+                                    )
+                                    if note:
+                                        success_msg += f" {note}"
+
+                                    proc_status.update(
+                                        label=f"Complete — {n_combo} field–soil combination(s)",
+                                        state="complete",
+                                        expanded=False,
+                                    )
+                        except Exception as e:
+                            proc_status.update(
+                                label="Processing failed with an error.",
+                                state="error",
                             )
+                            st.exception(e)
 
-                            st.session_state["field_specific_soil_path"] = str(out_soil)
-                            st.session_state["field_soil_lookup_csv"] = str(out_lookup)
-                            st.session_state["field_soil_usersoil_csv"] = str(out_usersoil)
-
-                            note = (info.get("usersoil_note") or "").strip()
-                            msg = (
-                                f"Field-specific soil raster saved "
-                                f"({info.get('n_new_combos', 0)} new field–soil combinations)."
-                            )
-                            if note:
-                                msg += f" {note}"
-                            st.success(msg)
-                    except Exception as e:
-                        st.exception(e)
+                    if success_msg:
+                        st.success(success_msg)
 
 
 def step5_preprocessing_options_section() -> None:

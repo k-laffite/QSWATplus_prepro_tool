@@ -5,6 +5,7 @@ mosaic, clip, reproject, and land use class extraction/reclassification.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,7 +17,7 @@ import rasterio
 from rasterio.features import rasterize as rasterio_rasterize
 from rasterio.merge import merge as rasterio_merge
 from rasterio.warp import calculate_default_transform, reproject, Resampling
-from rasterio.transform import from_bounds
+from rasterio.transform import from_bounds, array_bounds
 import rasterio.mask
 
 # Allowed HUC attribute column names in the HUC File Geodatabase.
@@ -114,6 +115,61 @@ def _bounds_dict(bounds: Any) -> Dict[str, float]:
     return {"left": float(left), "bottom": float(bottom), "right": float(right), "top": float(top)}
 
 
+def _grid_from_vector_extent(
+    gdf: gpd.GeoDataFrame,
+    template_raster_path: Optional[str] = None,
+    target_resolution: Optional[float] = None,
+) -> Tuple[Any, Tuple[int, int], Any]:
+    """Build an output grid from vector extent, optionally snapped to a template raster grid."""
+    if gdf.crs is None:
+        raise ValueError("GeoDataFrame must have a CRS set.")
+
+    if template_raster_path:
+        with rasterio.open(template_raster_path) as src:
+            template_crs = src.crs
+            template_transform = src.transform
+        if gdf.crs != template_crs:
+            gdf = gdf.to_crs(template_crs)
+
+        left, bottom, right, top = gdf.total_bounds
+        xres = float(abs(template_transform.a))
+        yres = float(abs(template_transform.e))
+        x_origin = float(template_transform.c)
+        y_origin = float(template_transform.f)
+
+        snapped_left = x_origin + math.floor((left - x_origin) / xres) * xres
+        snapped_right = x_origin + math.ceil((right - x_origin) / xres) * xres
+        snapped_top = y_origin - math.floor((y_origin - top) / yres) * yres
+        snapped_bottom = y_origin - math.ceil((y_origin - bottom) / yres) * yres
+
+        width_px = max(1, int(round((snapped_right - snapped_left) / xres)))
+        height_px = max(1, int(round((snapped_top - snapped_bottom) / yres)))
+
+        out_transform = from_bounds(
+            snapped_left,
+            snapped_bottom,
+            snapped_right,
+            snapped_top,
+            width_px,
+            height_px,
+        )
+        out_shape = (height_px, width_px)
+        out_crs = template_crs
+    else:
+        if target_resolution is None or target_resolution <= 0:
+            raise ValueError("target_resolution (e.g. 30 meters) is required when no template raster is provided.")
+        left, bottom, right, top = gdf.total_bounds
+        width_px = int((right - left) / target_resolution)
+        height_px = int((top - bottom) / target_resolution)
+        width_px = max(1, width_px)
+        height_px = max(1, height_px)
+        out_transform = from_bounds(left, bottom, right, top, width_px, height_px)
+        out_shape = (height_px, width_px)
+        out_crs = gdf.crs
+
+    return out_transform, out_shape, out_crs
+
+
 def rasterize_vector_to_raster(
     gdf: gpd.GeoDataFrame,
     value_column: str,
@@ -121,14 +177,18 @@ def rasterize_vector_to_raster(
     template_raster_path: Optional[str] = None,
     target_resolution: Optional[float] = None,
     nodata: int = -9999,
+    output_transform: Optional[Any] = None,
+    output_shape: Optional[Tuple[int, int]] = None,
+    output_crs: Optional[Any] = None,
 ) -> str:
     """
     Rasterize a GeoDataFrame using a numeric attribute for cell values.
 
     If template_raster_path is provided (e.g. a DEM), the output grid uses that
-    raster's transform, shape, and CRS so the result aligns perfectly with the DEM.
-    Otherwise, target_resolution (in CRS units, e.g. meters) is required and the
-    grid is built from the GeoDataFrame's extent.
+    raster's CRS and cell size, snapped to the DEM grid origin, while expanding
+    to cover the full GeoDataFrame extent. This preserves the full vector footprint
+    instead of clipping to the DEM footprint. Otherwise, target_resolution (in CRS
+    units, e.g. meters) is required and the grid is built from the GeoDataFrame's extent.
 
     Parameters
     ----------
@@ -139,7 +199,8 @@ def rasterize_vector_to_raster(
     out_path : Path
         Output GeoTIFF path.
     template_raster_path : str, optional
-        Path to a raster (e.g. DEM) to use for transform, shape, and CRS.
+        Path to a raster (e.g. DEM) to use for CRS and cell size. The output grid
+        is snapped to the template grid while covering the full vector extent.
     target_resolution : float, optional
         Resolution in CRS units (e.g. meters) when no template is used.
     nodata : int
@@ -155,28 +216,20 @@ def rasterize_vector_to_raster(
     if gdf.crs is None:
         raise ValueError("GeoDataFrame must have a CRS set.")
 
-    if template_raster_path:
-        with rasterio.open(template_raster_path) as src:
-            template_crs = src.crs
-            template_transform = src.transform
-            template_shape = (src.height, src.width)
-        if gdf.crs != template_crs:
-            gdf = gdf.to_crs(template_crs)
-        out_transform = template_transform
-        out_shape = template_shape
-        out_crs = template_crs
+    if output_transform is not None and output_shape is not None and output_crs is not None:
+        out_transform = output_transform
+        out_shape = output_shape
+        out_crs = output_crs
+        if gdf.crs != out_crs:
+            gdf = gdf.to_crs(out_crs)
     else:
-        if target_resolution is None or target_resolution <= 0:
-            raise ValueError("target_resolution (e.g. 30 meters) is required when no template raster is provided.")
-        left, bottom, right, top = gdf.total_bounds
-        # Pixel size in x and y (same for typical DEM)
-        width_px = int((right - left) / target_resolution)
-        height_px = int((top - bottom) / target_resolution)
-        width_px = max(1, width_px)
-        height_px = max(1, height_px)
-        out_transform = from_bounds(left, bottom, right, top, width_px, height_px)
-        out_shape = (height_px, width_px)
-        out_crs = gdf.crs
+        out_transform, out_shape, out_crs = _grid_from_vector_extent(
+            gdf,
+            template_raster_path=template_raster_path,
+            target_resolution=target_resolution,
+        )
+        if gdf.crs != out_crs:
+            gdf = gdf.to_crs(out_crs)
 
     # Build (geometry, value) pairs; use numeric type for raster
     values = gdf[value_column]
@@ -207,6 +260,33 @@ def rasterize_vector_to_raster(
     ) as dest:
         dest.write(rasterized, 1)
 
+    return str(out_path)
+
+
+def combine_aligned_rasters(
+    raster_paths: List[str],
+    out_path: Path,
+    nodata: int = -9999,
+) -> str:
+    """Combine aligned categorical rasters by taking the first non-nodata pixel."""
+    if not raster_paths:
+        raise ValueError("At least one raster path is required.")
+
+    out_path = Path(out_path)
+    with rasterio.open(raster_paths[0]) as src0:
+        base = src0.read(1)
+        meta = src0.meta.copy()
+
+    out_arr = base.copy()
+    for p in raster_paths[1:]:
+        with rasterio.open(p) as src:
+            arr = src.read(1)
+        fill_mask = (out_arr == nodata) & (arr != nodata)
+        out_arr[fill_mask] = arr[fill_mask]
+
+    meta.update({"nodata": nodata})
+    with rasterio.open(out_path, "w", **meta) as dest:
+        dest.write(out_arr, 1)
     return str(out_path)
 
 
@@ -368,6 +448,81 @@ def warp_raster_to_template(
         })
         out_data = np.rint(dst).astype(np.int32)
         with rasterio.open(out_path, "w", **tpl_meta) as dest:
+            dest.write(out_data, 1)
+
+    return str(out_path)
+
+
+def warp_raster_to_template_grid(
+    source_path: str,
+    template_raster_path: str,
+    out_path: Path,
+) -> str:
+    """
+    Resample source raster to match the template raster's CRS and cell size while
+    snapping to the template grid origin and preserving the full source extent.
+    Uses nearest-neighbor resampling for categorical rasters.
+    """
+    out_path = Path(out_path)
+    with rasterio.open(template_raster_path) as tpl:
+        tpl_transform = tpl.transform
+        dst_crs = tpl.crs
+        xres = float(abs(tpl_transform.a))
+        yres = float(abs(tpl_transform.e))
+        x_origin = float(tpl_transform.c)
+        y_origin = float(tpl_transform.f)
+
+    with rasterio.open(source_path) as src:
+        src_bounds = src.bounds
+        nodata_out = src.nodata
+        if nodata_out is None:
+            nodata_out = -9999
+
+        left, bottom, right, top = src_bounds.left, src_bounds.bottom, src_bounds.right, src_bounds.top
+        if src.crs != dst_crs:
+            dst_bounds = rasterio.warp.transform_bounds(src.crs, dst_crs, left, bottom, right, top)
+            left, bottom, right, top = dst_bounds
+
+        snapped_left = x_origin + math.floor((left - x_origin) / xres) * xres
+        snapped_right = x_origin + math.ceil((right - x_origin) / xres) * xres
+        snapped_top = y_origin - math.floor((y_origin - top) / yres) * yres
+        snapped_bottom = y_origin - math.ceil((y_origin - bottom) / yres) * yres
+
+        dst_w = max(1, int(round((snapped_right - snapped_left) / xres)))
+        dst_h = max(1, int(round((snapped_top - snapped_bottom) / yres)))
+        dst_transform = from_bounds(
+            snapped_left,
+            snapped_bottom,
+            snapped_right,
+            snapped_top,
+            dst_w,
+            dst_h,
+        )
+
+        dst = np.full((dst_h, dst_w), nodata_out, dtype=np.float64)
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dst,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.nearest,
+        )
+
+        out_meta = src.meta.copy()
+        out_meta.update({
+            "driver": "GTiff",
+            "height": dst_h,
+            "width": dst_w,
+            "transform": dst_transform,
+            "crs": dst_crs,
+            "count": 1,
+            "dtype": "int32",
+            "nodata": int(nodata_out) if np.isfinite(nodata_out) else -9999,
+        })
+        out_data = np.rint(dst).astype(np.int32)
+        with rasterio.open(out_path, "w", **out_meta) as dest:
             dest.write(out_data, 1)
 
     return str(out_path)
@@ -537,6 +692,7 @@ def apply_field_specific_soil_overlay(
     out_soil_path: Path,
     out_lookup_csv: Path,
     out_usersoil_csv: Path,
+    soil_id_map: Optional[Dict[int, int]] = None,
 ) -> Dict[str, Any]:
     """
     Rasterize crop field polygons to the soil raster grid, then assign new pixel IDs for each
@@ -575,8 +731,14 @@ def apply_field_specific_soil_overlay(
         height, width = src.height, src.width
         nodata_in = src.nodata
         meta = src.meta.copy()
+        soil_bounds = src.bounds
 
     soil_int = np.rint(soil_arr).astype(np.int64, copy=False)
+    if soil_id_map:
+        mapped_soil = soil_int.copy()
+        for raw_val, true_id in soil_id_map.items():
+            mapped_soil[soil_int == int(raw_val)] = int(true_id)
+        soil_int = mapped_soil
 
     fg = fields_gdf.copy().reset_index(drop=True)
     if fg.crs is None:
@@ -608,8 +770,44 @@ def apply_field_specific_soil_overlay(
         max_mukey = int(np.max(soil_int)) if soil_int.size else 0
 
     mask_field = field_arr > 0
+    if nodata_in is not None and np.isfinite(nodata_in):
+        mask_field &= soil_arr != nodata_in
     if not mask_field.any():
-        raise ValueError("No crop field polygons overlap the soil raster extent.")
+        field_pixels = int((field_arr > 0).sum())
+        valid_soil_pixels = int(valid_soil.sum())
+        overlap_pixels = int(mask_field.sum())
+        field_bounds = None
+        if len(fg) > 0:
+            fb = fg.total_bounds
+            field_bounds = {
+                "left": float(fb[0]),
+                "bottom": float(fb[1]),
+                "right": float(fb[2]),
+                "top": float(fb[3]),
+            }
+        res_x = float(abs(transform.a))
+        res_y = float(abs(transform.e))
+        debug_lines = [
+            "No crop field polygons overlap the soil raster extent.",
+            "",
+            "Debug info:",
+            f"- Soil raster path: {soil_raster_path}",
+            f"- Soil CRS: {crs}",
+            f"- Soil bounds: left={soil_bounds.left:.3f}, bottom={soil_bounds.bottom:.3f}, right={soil_bounds.right:.3f}, top={soil_bounds.top:.3f}",
+            f"- Soil raster shape: height={height}, width={width}",
+            f"- Soil raster resolution: x={res_x:.6g}, y={res_y:.6g}",
+            f"- Soil nodata: {nodata_in}",
+            f"- Valid soil pixels: {valid_soil_pixels}",
+            f"- Crop fields CRS after reprojection: {fg.crs}",
+            f"- Crop field feature count: {len(fg)}",
+            f"- Rasterized field pixels: {field_pixels}",
+            f"- Overlap pixels with valid soil: {overlap_pixels}",
+        ]
+        if field_bounds is not None:
+            debug_lines.append(
+                f"- Crop field bounds after reprojection: left={field_bounds['left']:.3f}, bottom={field_bounds['bottom']:.3f}, right={field_bounds['right']:.3f}, top={field_bounds['top']:.3f}"
+            )
+        raise ValueError("\n".join(debug_lines))
 
     f_flat = field_arr[mask_field]
     s_flat = soil_int[mask_field]
