@@ -676,6 +676,55 @@ def _pick_usersoil_name_col(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
+def _ssurgo_raster_key_columns(
+    df: pd.DataFrame,
+    mukey_col: Optional[str],
+    id_col: Optional[str],
+) -> List[str]:
+    """
+    Columns used to match a raster integer to a SSURGO row (parent lookup).
+
+    Only **MUID** (id_col) and **MUKEY** are used. SEQN / SOIL_ID / OBJECTID are excluded:
+    SEQN often equals unrelated integers (e.g. same as another row's MUID), producing
+    wrong lookup names (e.g. Raster_Value 94928 → Kinzua instead of Chappell).
+
+    Order is **MUID then MUKEY** so field/parent resolution prefers the component id when both match.
+    """
+    cols: List[str] = []
+    for c in (id_col, mukey_col):
+        if c and c in df.columns and c not in cols:
+            cols.append(c)
+    return cols
+
+
+def _build_raster_value_to_name(
+    ssurgo_df: pd.DataFrame,
+    name_col: str,
+    mukey_col: Optional[str],
+    id_col: str,
+) -> Dict[int, str]:
+    """
+    Map raster integers → unique display names.
+
+    - Register **MUID** first (last row wins if duplicate MUIDs in a merged table).
+    - Then register **MUKEY**, overwriting on collision so SSURGO map-unit grids / VAT
+      MUKEY values take precedence over the same integer used as MUID elsewhere (rare).
+    """
+    out: Dict[int, str] = {}
+    for _, row in ssurgo_df.iterrows():
+        lab = _ssurgo_row_unique_name(row, name_col, mukey_col, id_col)
+        mid = _normalize_mukey(row[id_col])
+        if mid is not None:
+            out[mid] = lab
+    if mukey_col:
+        for _, row in ssurgo_df.iterrows():
+            lab = _ssurgo_row_unique_name(row, name_col, mukey_col, id_col)
+            mk = _normalize_mukey(row[mukey_col])
+            if mk is not None:
+                out[mk] = lab
+    return out
+
+
 def _normalize_mukey(val: Any) -> Optional[int]:
     if pd.isna(val):
         return None
@@ -683,6 +732,39 @@ def _normalize_mukey(val: Any) -> Optional[int]:
         return int(float(val))
     except (ValueError, TypeError):
         return None
+
+
+def _unique_soil_snam(base_name: Any, suffix_id: Any) -> str:
+    """
+    Build a unique soil label for SNAM/lookup: ``{base}_{suffix_id}``.
+    Used so QSWAT+ can join lookup ``Name`` to ``usersoil`` when SNAM must be unique.
+    """
+    base = str(base_name).strip() if pd.notna(base_name) else ""
+    suf_int = _normalize_mukey(suffix_id)
+    if suf_int is not None:
+        suffix_str = str(suf_int)
+    elif pd.notna(suffix_id):
+        suffix_str = str(suffix_id).strip()
+    else:
+        suffix_str = "na"
+    if base:
+        return f"{base}_{suffix_str}"
+    return f"soil_{suffix_str}"
+
+
+def _ssurgo_row_unique_name(
+    row: pd.Series,
+    name_col: str,
+    mukey_col: Optional[str],
+    id_col: str,
+) -> str:
+    """Prefer MUKEY in the suffix (e.g. ``Valent_94477``); fall back to MUID / id_col."""
+    suf: Any = None
+    if mukey_col and mukey_col in row.index and pd.notna(row[mukey_col]):
+        suf = row[mukey_col]
+    else:
+        suf = row[id_col]
+    return _unique_soil_snam(row[name_col], suf)
 
 
 def apply_field_specific_soil_overlay(
@@ -700,8 +782,8 @@ def apply_field_specific_soil_overlay(
 
     Writes:
       - Field-specific soil GeoTIFF (int32)
-      - lookup_soil.csv: Raster_Value, Name
-      - usersoil.csv: original SSURGO rows plus duplicated rows for new IDs
+      - lookup_soil.csv: Raster_Value, Name (Name matches usersoil name column; base rows use ``SNAM_MUID``)
+      - usersoil.csv: SSURGO rows with unique name column (``{SNAM}_{MUKEY}`` when MUKEY exists, else MUID) plus appended field-specific rows
     """
     out_soil_path = Path(out_soil_path)
     out_lookup_csv = Path(out_lookup_csv)
@@ -710,19 +792,31 @@ def apply_field_specific_soil_overlay(
     mukey_col = _pick_ssurgo_mukey_col(ssurgo_df)
     id_col = _pick_usersoil_id_col(ssurgo_df)
     name_col = _pick_usersoil_name_col(ssurgo_df)
+    raster_key_cols = _ssurgo_raster_key_columns(ssurgo_df, mukey_col, id_col)
 
-    mukey_to_name: Dict[int, str] = {}
-    if name_col is not None:
-        key_col = mukey_col if mukey_col is not None else id_col
-        if key_col is not None:
-            for _, row in ssurgo_df.iterrows():
-                mk = _normalize_mukey(row[key_col])
+    raster_value_to_name: Dict[int, str] = {}
+    if name_col is not None and id_col is not None:
+        raster_value_to_name = _build_raster_value_to_name(ssurgo_df, name_col, mukey_col, id_col)
+    elif name_col is not None:
+        for _, row in ssurgo_df.iterrows():
+            nm = row[name_col]
+            for kc in raster_key_cols:
+                mk = _normalize_mukey(row[kc])
                 if mk is None:
                     continue
-                nm = row[name_col]
                 label = str(nm) if pd.notna(nm) else str(mk)
-                if mk not in mukey_to_name:
-                    mukey_to_name[mk] = label
+                if mk not in raster_value_to_name:
+                    raster_value_to_name[mk] = label
+
+    if soil_id_map:
+        for raw_v, true_id in soil_id_map.items():
+            try:
+                rv, tid = int(raw_v), int(true_id)
+            except (TypeError, ValueError):
+                continue
+            lbl = raster_value_to_name.get(tid)
+            if lbl:
+                raster_value_to_name.setdefault(rv, lbl)
 
     with rasterio.open(soil_raster_path) as src:
         soil_arr = src.read(1)
@@ -839,9 +933,10 @@ def apply_field_specific_soil_overlay(
         vid = int(v)
         if vid in newid_to_combo:
             fid, mkey = newid_to_combo[vid]
-            label = f"Field_{fid}_Soil_{mkey}"
+            base_lbl = raster_value_to_name.get(mkey, str(mkey))
+            label = f"Field_{fid}_Soil_{base_lbl}"
         else:
-            label = mukey_to_name.get(vid, str(vid))
+            label = raster_value_to_name.get(vid, str(vid))
         lookup_rows.append({"Raster_Value": vid, "Name": label})
 
     lookup_df = pd.DataFrame(lookup_rows).sort_values("Raster_Value")
@@ -858,15 +953,19 @@ def apply_field_specific_soil_overlay(
             "usersoil_note": "ID/Name columns not found; SSURGO table copied without appended rows.",
         }
 
+    usersoil_out[name_col] = [
+        _ssurgo_row_unique_name(r, name_col, mukey_col, id_col) for _, r in usersoil_out.iterrows()
+    ]
+
     new_rows: List[pd.Series] = []
     for (fid, mkey), new_id in combo_to_new.items():
         parent = pd.DataFrame()
-        if mukey_col is not None:
-            mask = ssurgo_df[mukey_col].apply(lambda x: _normalize_mukey(x) == mkey)
-            parent = ssurgo_df.loc[mask]
-        if parent.empty and id_col is not None:
-            mask = ssurgo_df[id_col].apply(lambda x: _normalize_mukey(x) == mkey)
-            parent = ssurgo_df.loc[mask]
+        for kc in raster_key_cols:
+            mask = ssurgo_df[kc].apply(lambda x: _normalize_mukey(x) == mkey)
+            cand = ssurgo_df.loc[mask]
+            if not cand.empty:
+                parent = cand
+                break
         if parent.empty:
             continue
         row = parent.iloc[0].copy()
@@ -874,16 +973,34 @@ def apply_field_specific_soil_overlay(
             row[id_col] = new_id
         except Exception:
             row[id_col] = str(new_id)
-        row[name_col] = f"Field_{int(fid)}_Soil_{int(mkey)}"
+        soil_lbl = raster_value_to_name.get(mkey, str(mkey))
+        row[name_col] = f"Field_{int(fid)}_Soil_{soil_lbl}"
         new_rows.append(row)
 
     if new_rows:
         usersoil_out = pd.concat([usersoil_out, pd.DataFrame(new_rows)], ignore_index=True)
     usersoil_out.to_csv(out_usersoil_csv, index=False)
 
+    n_unmapped_lookup = sum(
+        1
+        for v in unique_vals.tolist()
+        if not (nodata_in is not None and np.isfinite(nodata_in) and int(v) == int(nodata_in))
+        and int(v) not in newid_to_combo
+        and int(v) not in raster_value_to_name
+    )
+    note_parts = []
+    if n_unmapped_lookup and name_col and id_col:
+        note_parts.append(
+            f"{n_unmapped_lookup} raster value(s) had no match in SSURGO key columns "
+            f"{raster_key_cols!r}; lookup used the raw integer as Name. "
+            "Use a soil raster whose values match MUKEY/MUID (or configure a VAT map in Step 2)."
+        )
+
     return {
         "soil_path": str(out_soil_path),
         "lookup_csv": str(out_lookup_csv),
         "usersoil_csv": str(out_usersoil_csv),
         "n_new_combos": len(combo_to_new),
+        "n_lookup_unmapped": n_unmapped_lookup,
+        "usersoil_note": " ".join(note_parts).strip(),
     }

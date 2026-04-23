@@ -10,6 +10,7 @@ Sequential workflow:
   6. Final Preview and Export
 """
 
+import hashlib
 import io
 import shutil
 import tempfile
@@ -140,6 +141,7 @@ def init_session_state() -> None:
         "soil_mukey_map": None,
         "soil_true_id_col": None,
         "soil_pixel_value_col": None,
+        "soil_vat_path_override": None,
         "merge_raster_debug_landuse_uploads": None,
         "merge_raster_debug_soil_uploads": None,
     }
@@ -332,6 +334,66 @@ def _find_case_insensitive_column(columns: List[str], target: str) -> Optional[s
     return None
 
 
+def _column_looks_like_oid(name: str) -> bool:
+    n = str(name).lower()
+    if n in ("oid", "fid", "objectid", "objectid_1", "raster_objectid", "rowid", "rid", "ogc_fid"):
+        return True
+    return "object" in n and "id" in n
+
+
+def _default_vat_pixel_value_column(cols: List[str]) -> str:
+    """
+    Default column for values stored in the .tif: usually *not* row OID/ OBJECTID.
+    """
+    if not cols:
+        return ""
+    for target in (
+        "VALUE",
+        "RASTERVA",
+        "RASTERVALU",  # DBF 10-char truncation variants
+        "RASTERRVAL",
+        "UNIQUEVALU",  # UniqueValue, UniqueValue_*
+        "UNIQVALUE",
+        "UNIQVAL",
+        "COUNTYVALU",
+        "CATEGORY",
+    ):
+        c = _find_case_insensitive_column(cols, target)
+        if c:
+            return c
+    for col in cols:
+        cl = str(col).lower()
+        if _column_looks_like_oid(col) or "mukey" in cl or "muid" in cl:
+            continue
+        if "value" in cl or (cl.startswith("v") and "alue" in cl):
+            return col
+    for col in cols:
+        if not _column_looks_like_oid(col) and "mukey" not in str(col).lower() and "muid" not in str(col).lower():
+            return col
+    return cols[0]
+
+
+def _default_vat_mukey_column(cols: List[str]) -> str:
+    """
+    Default column for map-unit key (e.g. MUKEY) in the attribute table.
+    """
+    if not cols:
+        return ""
+    for target in ("MUKEY", "MapUnitKey", "MAPUNITSKEY", "MUSYM"):
+        c = _find_case_insensitive_column(cols, target)
+        if c:
+            return c
+    for col in cols:
+        cl = str(col).lower()
+        if "mukey" in cl or (cl.startswith("mu") and "key" in cl):
+            return col
+    for col in cols:
+        cl = str(col).lower()
+        if not _column_looks_like_oid(col) and "value" not in cl and "count" not in cl:
+            return col
+    return cols[0]
+
+
 def _combine_vector_uploads(vector_uploads: List[Dict[str, Any]]) -> gpd.GeoDataFrame:
     """Merge multiple vector uploads into one GeoDataFrame, aligning CRS to the first layer."""
     if not vector_uploads:
@@ -468,6 +530,7 @@ def step2_uploads_section() -> None:
             soil_files, "soil",
             (".tif", ".tiff", ".zip", ".shp", ".shx", ".dbf", ".prj", ".csv"),
         )
+        st.session_state["soil_vat_path_override"] = None
         st.session_state["last_soil_fingerprint"] = soil_fp
     if soil_fp is None:
         st.session_state["last_soil_fingerprint"] = None
@@ -727,61 +790,112 @@ def step2_uploads_section() -> None:
         if soil_vector_uploads:
             st.caption("Soil vector ID selection is configured in the Soil vector processing section above.")
         else:
-            st.subheader("Soil ID configuration")
+            st.subheader("Soil ID configuration (raster with attribute table)")
             soil_u = soil_uploads[0]
             soil_meta = soil_u.get("metadata", {})
-            if soil_u.get("vat_table_path"):
-                try:
-                    vat_df = _cached_load_table(soil_u["vat_table_path"])
-                    vat_cols = list(vat_df.columns)
-                    if vat_cols:
-                        default_true_id = _find_case_insensitive_column(vat_cols, "MUKEY") or vat_cols[0]
-                        true_id_col = st.selectbox(
-                            "Select the column containing the true Soil ID (e.g., MUKEY)",
-                            options=vat_cols,
-                            index=vat_cols.index(default_true_id),
-                            key="soil_true_id_col_select",
-                        )
-                        default_pixel_col = (
-                            _find_case_insensitive_column(vat_cols, "VALUE")
-                            or _find_case_insensitive_column(vat_cols, "VALUE_1")
-                            or _find_case_insensitive_column(vat_cols, "COUNTYVALUE")
-                            or vat_cols[0]
-                        )
-                        pixel_val_col = st.selectbox(
-                            "Select the column containing the raster pixel values",
-                            options=vat_cols,
-                            index=vat_cols.index(default_pixel_col),
-                            key="soil_pixel_value_col_select",
-                        )
-                        st.session_state["soil_true_id_col"] = true_id_col
-                        st.session_state["soil_pixel_value_col"] = pixel_val_col
-                        st.session_state["vector_soil_id_col"] = None
-                        map_df = vat_df[[pixel_val_col, true_id_col]].dropna().copy()
-                        mapping = {}
-                        for _, row in map_df.iterrows():
-                            try:
-                                mapping[int(float(row[pixel_val_col]))] = int(float(row[true_id_col]))
-                            except (TypeError, ValueError):
-                                continue
-                        st.session_state["soil_mukey_map"] = mapping
-                        if mapping:
-                            st.caption(f"Loaded {len(mapping)} raster pixel-to-soil-ID mappings from the Soil VAT.")
+            cache = Path(st.session_state["upload_cache_dir"])
+            st.session_state["vector_soil_id_col"] = None
+
+            if soil_meta.get("type") == "raster":
+                st.caption(
+                    "GeoTIFFs often store **class codes** (1, 121, …) in pixels while **MUKEY** (e.g. 94477) lives "
+                    "in the attribute table. Map **value column → MUKEY column**; do **not** use row Object ID as the pixel value."
+                )
+                vat_file = st.file_uploader(
+                    "Upload soil attribute table (optional if a CSV/DBF was uploaded with the .tif with the same base name)",
+                    type=["csv", "dbf"],
+                    key="soil_raster_vat_file_uploader",
+                )
+                if vat_file is not None:
+                    vat_dir = cache / "soil_raster_vat"
+                    vat_dir.mkdir(parents=True, exist_ok=True)
+                    out_vat = vat_dir / Path(vat_file.name).name
+                    out_vat.write_bytes(vat_file.getbuffer())
+                    st.session_state["soil_vat_path_override"] = str(out_vat)
+
+                vat_path: Optional[Path] = None
+                ov = st.session_state.get("soil_vat_path_override")
+                if ov and Path(ov).exists():
+                    vat_path = Path(ov)
+                else:
+                    side = soil_u.get("vat_table_path")
+                    if side and Path(side).exists():
+                        vat_path = Path(side)
+                if st.session_state.get("soil_vat_path_override") and soil_u.get("vat_table_path"):
+                    if st.button("Use sidecar table instead of uploaded VAT", key="soil_vat_use_sidecar"):
+                        st.session_state["soil_vat_path_override"] = None
+                        st.rerun()
+                vat_path_str = str(vat_path) if vat_path is not None and vat_path.exists() else None
+                vat_key = (
+                    hashlib.md5((vat_path_str or "none").encode("utf-8", errors="replace"))
+                    .hexdigest()[:12]
+                )
+
+                if vat_path_str:
+                    try:
+                        vat_df = _cached_load_table(Path(vat_path_str))
+                        vat_cols = [str(c) for c in vat_df.columns]
+                        if not vat_cols:
+                            st.warning("The soil attribute table has no columns.")
+                            st.session_state["soil_mukey_map"] = None
+                            st.session_state["soil_true_id_col"] = None
+                            st.session_state["soil_pixel_value_col"] = None
                         else:
-                            st.warning("No valid pixel value to Soil ID mappings were found in the Soil VAT.")
-                    else:
-                        st.warning("The uploaded Soil VAT contains no columns.")
+                            def_true = _default_vat_mukey_column(vat_cols)
+                            def_pix = _default_vat_pixel_value_column(vat_cols)
+                            idx_t = vat_cols.index(def_true) if def_true in vat_cols else 0
+                            idx_p = vat_cols.index(def_pix) if def_pix in vat_cols else 0
+                            true_id_col = st.selectbox(
+                                "Column with **MUKEY** (map unit key) — the soil id used with SSURGO, not Object ID",
+                                options=vat_cols,
+                                index=idx_t,
+                                key=f"soil_vat_mukey_col_{vat_key}",
+                            )
+                            pixel_val_col = st.selectbox(
+                                "Column with **raster / cell values** (what is stored in the .tif, e.g. 121) — not OID",
+                                options=vat_cols,
+                                index=idx_p,
+                                key=f"soil_vat_pixel_col_{vat_key}",
+                            )
+                            st.session_state["soil_true_id_col"] = true_id_col
+                            st.session_state["soil_pixel_value_col"] = pixel_val_col
+                            map_df = vat_df[[pixel_val_col, true_id_col]].dropna().copy()
+                            mapping: Dict[int, int] = {}
+                            for _, row in map_df.iterrows():
+                                try:
+                                    mapping[int(float(row[pixel_val_col]))] = int(float(row[true_id_col]))
+                                except (TypeError, ValueError):
+                                    continue
+                            st.session_state["soil_mukey_map"] = mapping
+                            st.caption(f"Source: `{Path(vat_path_str).name}`.")
+                            if mapping:
+                                ex0, ex1 = next(iter(mapping.items()))
+                                st.caption(
+                                    f"Loaded **{len(mapping)}** cell-value → MUKEY mappings "
+                                    f"(example: pixel {ex0} → MUKEY {ex1})"
+                                )
+                            else:
+                                st.warning(
+                                    "No valid mappings. Check that the value column matches pixel values in the GeoTIFF "
+                                    "and the MUKEY column is numeric."
+                                )
+                    except Exception as ex:
+                        st.warning(f"Could not read the soil attribute table: {ex}")
                         st.session_state["soil_mukey_map"] = None
                         st.session_state["soil_true_id_col"] = None
                         st.session_state["soil_pixel_value_col"] = None
-                except Exception as ex:
-                    st.warning(f"Could not read the Soil VAT sidecar: {ex}")
+                else:
+                    st.warning(
+                        "**No attribute table (CSV/DBF)** found for the soil raster. The app will treat raw pixel values "
+                        "as soil ids (this often looks like 1, 2, 3 in `lookup_soil.csv` and is **not** correct for "
+                        "LUP/SSURGO rasters). Export the attribute table from ArcGIS or upload a CSV/DBF here, then set "
+                        "the two columns above once the file is loaded."
+                    )
                     st.session_state["soil_mukey_map"] = None
                     st.session_state["soil_true_id_col"] = None
                     st.session_state["soil_pixel_value_col"] = None
-            elif soil_meta.get("type") == "raster":
-                st.info("No Soil attribute table detected. Raster pixel values will be treated as the true Soil IDs.")
-                st.session_state["vector_soil_id_col"] = None
+            else:
+                st.caption("Soil is not a raster; VAT mapping is not used.")
                 st.session_state["soil_mukey_map"] = None
                 st.session_state["soil_true_id_col"] = None
                 st.session_state["soil_pixel_value_col"] = None
@@ -1029,6 +1143,7 @@ def step4_advanced_agricultural_hru_section() -> None:
                                 soil_meta = soil_u.get("raster_metadata") or soil_u.get("metadata") or {}
 
                                 st.write("**Step 2.5/5** — Step 4 source diagnostics…")
+                                sm = st.session_state.get("soil_mukey_map") or {}
                                 source_rows = [
                                     {
                                         "Selected Soil Source Name": soil_u.get("name", ""),
@@ -1037,7 +1152,11 @@ def step4_advanced_agricultural_hru_section() -> None:
                                         "Selected Soil Source CRS": soil_meta.get("crs", ""),
                                         "Selected Soil Source Resolution": soil_meta.get("resolution", ""),
                                         "Rasterized Path": soil_u.get("rasterized_path", ""),
-                                        "VAT Table Path": soil_u.get("vat_table_path", ""),
+                                        "Auto VAT sidecar": soil_u.get("vat_table_path", ""),
+                                        "Manual VAT file": st.session_state.get("soil_vat_path_override") or "",
+                                        "VAT MUKEY column": st.session_state.get("soil_true_id_col", ""),
+                                        "VAT pixel value column": st.session_state.get("soil_pixel_value_col", ""),
+                                        "Raster→MUKEY map entries": len(sm),
                                         "Vector Soil ID Column": st.session_state.get("vector_soil_id_col", ""),
                                     }
                                 ]
